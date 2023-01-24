@@ -131,7 +131,7 @@ impl StatefulJob for FileEraserJob {
 				tokio::fs::remove_dir_all(&info.root_path).await?;
 			}
 		} else {
-			warn!("missing job state, unable to fully finalise erase job");
+			warn!("missing job state, unable to fully finalize job");
 		}
 
 		Ok(Some(serde_json::to_value(&state.init)?))

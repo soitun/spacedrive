@@ -7,6 +7,7 @@ use std::{ffi::OsStr, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub mod archive;
 pub mod copy;
 pub mod cut;
 pub mod decrypt;
