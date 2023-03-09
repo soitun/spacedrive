@@ -24,7 +24,7 @@ use std::{
 	str::FromStr,
 };
 
-use chrono::{DateTime, FixedOffset, Local, Utc};
+use chrono::{DateTime, Local};
 use int_enum::IntEnum;
 use notify::{event::RemoveKind, Event};
 use prisma_client_rust::{raw, PrismaValue};
@@ -164,26 +164,11 @@ pub(super) async fn create_file(
 		.exec()
 		.await?;
 
-	object::select!(object_id { id has_thumbnail });
-
-	let size_str = fs_metadata.len().to_string();
-
-	let object = if let Some(object) = existing_object {
-		db.object()
-			.update(
-				object::id::equals(object.id),
-				vec![
-					object::size_in_bytes::set(size_str),
-					object::date_indexed::set(
-						Utc::now().with_timezone(&FixedOffset::east_opt(0).unwrap()),
-					),
-				],
-			)
-			.select(object_id::select())
-			.exec()
-			.await?
+	let (object_id, object_has_thumbnail) = if let Some(object) = existing_object {
+		(object.id, object.has_thumbnail)
 	} else {
-		db.object()
+		let obj = db
+			.object()
 			.create(
 				Uuid::new_v4().as_bytes().to_vec(),
 				vec![
@@ -191,24 +176,23 @@ pub(super) async fn create_file(
 						DateTime::<Local>::from(fs_metadata.created().unwrap()).into(),
 					),
 					object::kind::set(kind.int_value()),
-					object::size_in_bytes::set(size_str.clone()),
 				],
 			)
-			.select(object_id::select())
 			.exec()
-			.await?
+			.await?;
+
+		(obj.id, obj.has_thumbnail)
 	};
 
 	db.file_path()
 		.update(
 			file_path::location_id_id(location.id, created_file.id),
-			vec![file_path::object_id::set(Some(object.id))],
+			vec![file_path::object_id::set(Some(object_id))],
 		)
 		.exec()
 		.await?;
 
-	trace!("object: {:#?}", object);
-	if !object.has_thumbnail && !created_file.extension.is_empty() {
+	if !object_has_thumbnail && !created_file.extension.is_empty() {
 		generate_thumbnail(&created_file.extension, &cas_id, &event.paths[0], library).await;
 	}
 

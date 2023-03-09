@@ -42,7 +42,6 @@ pub struct Metadata {
 	pub important: bool,
 	pub note: Option<String>,
 	pub date_created: chrono::DateTime<FixedOffset>,
-	pub date_modified: chrono::DateTime<FixedOffset>,
 }
 
 const JOB_NAME: &str = "file_encryptor";
@@ -159,7 +158,6 @@ impl StatefulJob for FileEncryptorJob {
 							important: object.important,
 							note: object.note,
 							date_created: object.date_created,
-							date_modified: object.date_modified,
 						};
 
 						header
