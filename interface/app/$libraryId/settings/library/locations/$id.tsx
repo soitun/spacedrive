@@ -166,11 +166,18 @@ export const Component = () => {
 					</ToggleSection>
 				</div>
 				<Divider />
-				<div className="flex flex-col">
-					<Label className="grow">Indexer rules</Label>
-					<InfoText className="mb-1 mt-0">
-						Indexer rules allow you to specify paths to ignore using RegEx.
-					</InfoText>
+				<div className="flex flex-col rounded-md border border-app-line bg-app-overlay px-10 pt-8">
+					<div className="flex w-full items-center justify-between">
+						<div>
+							<Label className="!mb-2 grow !text-sm !font-bold">Indexer rules</Label>
+							<InfoText className="!mt-0 mb-4">
+								Indexer rules allow you to specify paths to ignore using RegEx.
+							</InfoText>
+						</div>
+						<Button className="px-5" variant="gray">
+							+ New
+						</Button>
+					</div>
 					<Controller
 						name="indexerRulesIds"
 						render={({ field }) => <IndexerRuleEditor field={field} editable />}
