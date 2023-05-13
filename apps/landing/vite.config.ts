@@ -19,6 +19,15 @@ export default defineConfig({
 		vercel(),
 		vercelSsr()
 	],
+	vercel: {
+		additionalEndpoints: [
+			{
+				source: 'edge/[target]/[arch]/[currentVersion].ts',
+				destination: '/[target]/[arch]/[currentVersion]',
+				edge: true
+			}
+		]
+	},
 	css: {
 		modules: {
 			localsConvention: 'camelCaseOnly'
