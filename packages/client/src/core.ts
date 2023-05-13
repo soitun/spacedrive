@@ -232,6 +232,8 @@ export type FileDeleterJobInit = { location_id: number; path_id: number }
  */
 export type Algorithm = "XChaCha20Poly1305" | "Aes256Gcm"
 
+export type LightScanArgs = { location_id: number; sub_path: string }
+
 export type Tag = { id: number; pub_id: number[]; name: string | null; color: string | null; total_objects: number | null; redundancy_goal: number | null; date_created: string; date_modified: string }
 
 export type JobReport = { id: string; name: string; action: string | null; data: number[] | null; metadata: any | null; is_background: boolean; created_at: string | null; started_at: string | null; completed_at: string | null; parent_id: string | null; status: JobStatus; task_count: number; completed_task_count: number; message: string }
@@ -316,8 +318,6 @@ export type FileDecryptorJobInit = { location_id: number; path_id: number; mount
 export type AutomountUpdateArgs = { uuid: string; status: boolean }
 
 export type Protected<T> = T
-
-export type LightScanArgs = { location_id: number; sub_path: string }
 
 export type RestoreBackupArgs = { password: Protected<string>; secret_key: Protected<string>; path: string }
 

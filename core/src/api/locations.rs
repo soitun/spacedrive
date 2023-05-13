@@ -96,8 +96,6 @@ pub(crate) fn mount() -> AlphaRouter<Ctx> {
 				.query(|(_, library), args: LocationExplorerArgs| async move {
 					let Library { db, .. } = &library;
 
-					dbg!(&args);
-
 					let location = find_location(&library, args.location_id)
 						.exec()
 						.await?
