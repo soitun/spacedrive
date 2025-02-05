@@ -9,12 +9,10 @@ runs:
   using: 'composite'
   steps:
     - name: Install pnpm
-      uses: pnpm/action-setup@v2
-      with:
-        version: 8.x.x
+      uses: pnpm/action-setup@v4
 
     - name: Install Node.js
-      uses: actions/setup-node@v3
+      uses: actions/setup-node@v4
       with:
         token: ${{ inputs.token }}
         check-latest: true
@@ -22,4 +20,7 @@ runs:
 
     - name: Install pnpm deps
       shell: ${{ runner.os == 'Windows' && 'powershell' || 'bash' }}
+      env:
+        NODE_ENV: debug
+        GITHUB_TOKEN: ${{ inputs.token }}
       run: pnpm i --frozen-lockfile

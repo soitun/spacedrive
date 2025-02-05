@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
-
+use specta::Type;
+use strum_macros::{Display, EnumIter};
+// Note: The order of this enum should never change, and always be kept in sync with `packages/client/src/utils/objectKind.ts`
 #[repr(i32)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Display, Copy, EnumIter, Type, Serialize, Deserialize, Eq, PartialEq)]
 pub enum ObjectKind {
 	/// A file that can not be identified by the indexer
 	Unknown = 0,
@@ -27,7 +29,7 @@ pub enum ObjectKind {
 	Alias = 10,
 	/// Raw bytes encrypted by Spacedrive with self contained metadata
 	Encrypted = 11,
-	/// A link can open web pages, apps or Spaces
+	/// A key or certificate file
 	Key = 12,
 	/// A link can open web pages, apps or Spaces
 	Link = 13,
@@ -49,4 +51,12 @@ pub enum ObjectKind {
 	Database = 21,
 	/// E-book file
 	Book = 22,
+	/// Config file
+	Config = 23,
+	/// Dotfile
+	Dotfile = 24,
+	/// Screenshot
+	Screenshot = 25,
+	/// Label
+	Label = 26,
 }

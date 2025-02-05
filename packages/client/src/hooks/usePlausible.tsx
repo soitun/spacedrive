@@ -1,17 +1,14 @@
 import Plausible, { PlausibleOptions as PlausibleTrackerOptions } from 'plausible-tracker';
 import { useCallback, useEffect, useRef } from 'react';
-import { PlausiblePlatformType, telemetryStore, useDebugState, useTelemetryState } from '../stores';
 
-/**
- * This should be in sync with the Core's version.
- */
-const VERSION = '0.1.0';
+import { BuildInfo } from '../core';
+import { useDebugState } from '../stores/debugState';
+import { PlausiblePlatformType, telemetryState, useTelemetryState } from '../stores/telemetryState';
+
 const DOMAIN = 'app.spacedrive.com';
+const MOBILE_DOMAIN = 'mobile.spacedrive.com';
 
-const PlausibleProvider = Plausible({
-	trackLocalhost: true,
-	domain: DOMAIN
-});
+let plausibleInstance: ReturnType<typeof Plausible>;
 
 /**
  * This defines all possible options that may be provided by events upon submission.
@@ -19,13 +16,10 @@ const PlausibleProvider = Plausible({
  * This extends the standard options provided by the `plausible-tracker`
  * package, but also offers some additiional options for custom functionality.
  */
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
 interface PlausibleOptions extends PlausibleTrackerOptions {
-	/**
-	 * This should **only** be used in contexts where telemetry sharing
-	 * must be allowed/denied via external means. Currently it is not used by anything,
-	 * but probably will be in the future.
-	 */
-	telemetryOverride?: boolean;
+	// the only thing in here before was `telemetryOverride`, but we've removed it
+	// keeping this interface around should we need it in the future.
 }
 
 /**
@@ -84,6 +78,8 @@ type TagCreateEvent = BasePlausibleEvent<'tagCreate'>;
 type TagDeleteEvent = BasePlausibleEvent<'tagDelete'>;
 type TagAssignEvent = BasePlausibleEvent<'tagAssign'>;
 
+type PingEvent = BasePlausibleEvent<'ping'>;
+
 /**
  * All union of available, ready-to-use events.
  *
@@ -97,7 +93,8 @@ type PlausibleEvent =
 	| LocationDeleteEvent
 	| TagCreateEvent
 	| TagDeleteEvent
-	| TagAssignEvent;
+	| TagAssignEvent
+	| PingEvent;
 
 /**
  * An event information wrapper for internal use only.
@@ -108,7 +105,9 @@ interface PlausibleTrackerEvent {
 	eventName: string;
 	props: {
 		platform: PlausiblePlatformType;
-		version: string;
+		fullTelemetry: boolean;
+		coreVersion: string;
+		commitHash: string;
 		debug: boolean;
 	};
 	options: PlausibleTrackerOptions;
@@ -133,20 +132,24 @@ interface SubmitEventProps {
 	 */
 	screenWidth?: number;
 	/**
-	 * Whether or not telemetry sharing is enabled for the current client.
+	 * Whether or not full telemetry sharing is enabled for the current client.
 	 *
-	 * It is **crucial** that this is the direct output of `useTelemetryState().shareTelemetry`,
-	 * regardless of other conditions that may affect whether we share it (such as event overrides).
+	 * It is **crucial** that this is the direct output of `useTelemetryState().shareFullTelemetry`,
+	 * regardless of other conditions that may affect whether we share it.
 	 */
-	shareTelemetry: boolean;
+	shareFullTelemetry: boolean;
 	/**
 	 * It is **crucial** that this is sourced from the output of `useDebugState()`
 	 */
 	debugState: {
 		enabled: boolean;
-		shareTelemetry: boolean;
+		shareFullTelemetry: boolean;
 		telemetryLogging: boolean;
 	};
+	/**
+	 * The app's build info
+	 */
+	buildInfo: BuildInfo | undefined; // TODO(brxken128): ensure this is populated *always*
 }
 
 /**
@@ -160,8 +163,8 @@ interface SubmitEventProps {
  * If any of the following conditions are met, this will return and no data will be submitted:
  *
  * * If the app is in debug/development mode
- * * If a telemetry override is present, but it is not true
- * * If no telemetry override is present, and telemetry sharing is not true
+ * * If the user's telemetry preference is not "full", we will only send pings
+ * * If the user's telemetry preference is "none", we will never send any telemetry
  *
  * @privateRemarks
  * Telemetry sharing settings are never matched to `=== false`, but to `!== true` instead.
@@ -173,35 +176,46 @@ interface SubmitEventProps {
  */
 const submitPlausibleEvent = async ({ event, debugState, ...props }: SubmitEventProps) => {
 	if (props.platformType === 'unknown') return;
-	if (debugState.enabled && debugState.shareTelemetry !== true) return;
 	if (
-		'plausibleOptions' in event && 'telemetryOverride' in event.plausibleOptions
-			? event.plausibleOptions.telemetryOverride !== true
-			: props.shareTelemetry !== true
+		// if the user's telemetry preference is not "full", we should only send pings
+		props.shareFullTelemetry !== true &&
+		event.type !== 'ping'
 	)
 		return;
+
+	// using a singleton this way instead of instantiating at file eval (first time it's imported)
+	// because a user having "none" telemetry preference should mean Plausible never even initalizes
+	plausibleInstance ??= Plausible({
+		trackLocalhost: true,
+		domain: props.platformType === 'mobile' ? MOBILE_DOMAIN : DOMAIN
+	});
 
 	const fullEvent: PlausibleTrackerEvent = {
 		eventName: event.type,
 		props: {
 			platform: props.platformType,
-			version: VERSION,
+			fullTelemetry: props.shareFullTelemetry,
+			// we used to fall back to '0.1.0' here, but we should never report an actual version number if we don't know
+			coreVersion: props.buildInfo?.version ?? 'unknown',
+			commitHash: props.buildInfo?.commit ?? 'unknown',
 			debug: debugState.enabled
 		},
 		options: {
 			deviceWidth: props.screenWidth ?? window.screen.width,
-			// referrer: '', // TODO(brxken128): see if we could have this blank to prevent accidental IP logging
+			referrer: '',
+			// by default do not track current URL, if it's provided in plausibleOptions, that will be sent
+			url: '',
 			...('plausibleOptions' in event ? event.plausibleOptions : undefined)
 		},
 		callback: debugState.telemetryLogging
 			? () => {
 					const { callback: _, ...event } = fullEvent;
 					console.log(event);
-			  }
+				}
 			: undefined
 	};
 
-	PlausibleProvider.trackEvent(
+	plausibleInstance.trackEvent(
 		fullEvent.eventName,
 		{
 			props: fullEvent.props,
@@ -226,16 +240,10 @@ interface EventSubmissionCallbackProps {
  * The returned callback should only be fired once,
  * in order to prevent our analytics from being flooded.
  *
- * Certain events provide functionality to override the clients's telemetry sharing configuration.
- * This is not to ignore the user's choice, but because it should **only** be used in contexts where
- * telemetry sharing must be allowed/denied via external means.
- *
  * @remarks
  * If any of the following conditions are met, this will return and no data will be submitted:
  *
  * * If the app is in debug/development mode
- * * If a telemetry override is present, but it is not true
- * * If no telemetry override is present, and telemetry sharing is not true
  *
  * @returns a callback that, once executed, will submit the desired event
  *
@@ -255,65 +263,38 @@ interface EventSubmissionCallbackProps {
  * });
  * ```
  */
-export const usePlausibleEvent = () => {
-	const debugState = useDebugState();
+export const usePlausibleEvent = (): ((props: EventSubmissionCallbackProps) => Promise<void>) => {
 	const telemetryState = useTelemetryState();
+
+	const debugState = useDebugState();
 	const previousEvent = useRef({} as BasePlausibleEvent<string>);
 
-	return useCallback(
+	const sendPlausibleEvent = useCallback(
 		async (props: EventSubmissionCallbackProps) => {
 			if (previousEvent.current === props.event) return;
 			else previousEvent.current = props.event;
 
 			submitPlausibleEvent({
 				debugState,
-				shareTelemetry: telemetryState.shareTelemetry,
+				shareFullTelemetry: telemetryState.telemetryLevelPreference === 'full',
 				platformType: telemetryState.platform,
+				buildInfo: telemetryState.buildInfo,
 				...props
 			});
 		},
 		[debugState, telemetryState]
 	);
+
+	if (telemetryState.telemetryLevelPreference === 'none') return async (...args: any[]) => {};
+
+	return sendPlausibleEvent;
 };
 
-/**
- * These rules will be matched as regular expressions via `.replace()`
- * in a `forEach` loop.
- *
- * If a rule matches, the expression will be replaced with the target value.
- *
- * @example
- * ```ts
- * let path = "/ed0c715c-d095-4f6a-b83c-1d0b25cc89e7/location/1";
- * PageViewRegexRules.forEach((e) => (path = path.replace(e[0], e[1])));
- * assert(path === "/location");
- * ```
- */
-const PageViewRegexRules: [RegExp, string][] = [
+export interface PlausibleMonitorProps {
 	/**
-	 * This is for removing the library UUID from the current path
-	 */
-	[RegExp('/[a-f0-9]{8}-?[a-f0-9]{4}-?4[a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}'), ''],
-	/**
-	 * This is for removing location IDs from the current path
-	 */
-	[RegExp('/location/[0-9]+'), '/location'],
-	/**
-	 * This is for removing tag IDs from the current path
-	 */
-	[RegExp('/tag/[0-9]+'), '/tag'],
-	/**
-	 * This is for removing location IDs from the current path, when in library settings (e.g. `/settings/library/locations/12`)
-	 */
-	[RegExp('/locations/[0-9]+'), '/locations']
-];
-
-export interface PageViewMonitorProps {
-	/**
-	 * This should be unsanitized, and should still contain
-	 * all dynamic parameters (such as the library UUID).
+	 * This should be sanitized, containing no user-specific information.
 	 *
-	 * Ideally, this should be the output of `useLocation().pathname`
+	 * User-specific values should be replaced with their identifiers.
 	 *
 	 * @see {@link PageViewRegexRules} for sanitization
 	 */
@@ -343,23 +324,57 @@ export interface PageViewMonitorProps {
  *  });
  * ```
  */
-export const usePlausiblePageViewMonitor = ({ currentPath }: PageViewMonitorProps) => {
+export const usePlausiblePageViewMonitor = ({ currentPath }: PlausibleMonitorProps) => {
 	const plausibleEvent = usePlausibleEvent();
-
-	let path = currentPath;
-	PageViewRegexRules.forEach((e) => (path = path.replace(e[0], e[1])));
 
 	useEffect(() => {
 		plausibleEvent({
 			event: {
 				type: 'pageview',
-				plausibleOptions: { url: path }
+				plausibleOptions: { url: currentPath }
 			}
 		});
-	}, [path, plausibleEvent]);
+	}, [currentPath, plausibleEvent]);
 };
 
-export const initPlausible = ({ platformType }: { platformType: PlausiblePlatformType }) => {
-	telemetryStore.platform = platformType;
+/**
+ * A Plausible Analytics `ping` monitoring hook. It watches the router's current
+ * path, and sends events if a change in the path is detected.
+ *
+ * This should be included next to the {@link usePlausiblePageViewMonitor}.
+ *
+ * For desktop/web, we use this hook in the `$libraryId` layout and it covers the
+ * entire app (excluding onboarding, which should not be monitored).
+ *
+ * @remarks
+ * This will submit an 'ping' event, independently of what the currernt telemetry
+ * sharing settings are (minimum or full).
+ *
+ */
+export const usePlausiblePingMonitor = ({ currentPath }: PlausibleMonitorProps) => {
+	const plausibleEvent = usePlausibleEvent();
+
+	useEffect(() => {
+		plausibleEvent({
+			event: {
+				type: 'ping'
+			}
+		});
+	}, [currentPath, plausibleEvent]);
+};
+
+/**
+ * Initializes the `platform` and `buildInfo` properties on `telemetryState` so they can be used
+ * by Plausible if it's enabled.
+ */
+export const configureAnalyticsProperties = ({
+	platformType,
+	buildInfo
+}: {
+	platformType: PlausiblePlatformType;
+	buildInfo: BuildInfo | undefined;
+}) => {
+	telemetryState.platform = platformType;
+	telemetryState.buildInfo = buildInfo;
 	return;
 };

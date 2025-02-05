@@ -1,19 +1,23 @@
+use crate::library::LibraryId;
+
 use std::{
-	collections::HashMap,
+	collections::{HashMap, HashSet},
 	path::{Path, PathBuf},
 };
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{fs, io};
+use tokio::{
+	fs::{self, OpenOptions},
+	io::{self, AsyncWriteExt},
+};
 use tracing::error;
 use uuid::Uuid;
 
-static SPACEDRIVE_LOCATION_METADATA_FILE: &str = ".spacedrive";
+use super::LocationPubId;
 
-pub(super) type LibraryId = Uuid;
-pub(super) type LocationPubId = Uuid;
+static SPACEDRIVE_LOCATION_METADATA_FILE: &str = ".spacedrive";
 
 #[derive(Serialize, Deserialize, Default, Debug)]
 struct LocationMetadata {
@@ -31,13 +35,13 @@ struct SpacedriveLocationMetadata {
 	updated_at: DateTime<Utc>,
 }
 
-pub(super) struct SpacedriveLocationMetadataFile {
+pub struct SpacedriveLocationMetadataFile {
 	path: PathBuf,
 	metadata: SpacedriveLocationMetadata,
 }
 
 impl SpacedriveLocationMetadataFile {
-	pub(super) async fn try_load(
+	pub async fn try_load(
 		location_path: impl AsRef<Path>,
 	) -> Result<Option<Self>, LocationMetadataError> {
 		let metadata_file_name = location_path
@@ -52,10 +56,12 @@ impl SpacedriveLocationMetadataFile {
 						#[cfg(debug_assertions)]
 						{
 							error!(
+								metadata_file_name = %metadata_file_name.display(),
+								?e,
 								"Failed to deserialize corrupted metadata file, \
-								we will remove it and create a new one; File: {}; Error: {e}",
-								metadata_file_name.display()
+								we will remove it and create a new one;",
 							);
+
 							fs::remove_file(&metadata_file_name).await.map_err(|e| {
 								LocationMetadataError::Delete(
 									e,
@@ -83,7 +89,7 @@ impl SpacedriveLocationMetadataFile {
 		}
 	}
 
-	pub(super) async fn create_and_save(
+	pub async fn create_and_save(
 		library_id: LibraryId,
 		location_pub_id: Uuid,
 		location_path: impl AsRef<Path>,
@@ -114,7 +120,7 @@ impl SpacedriveLocationMetadataFile {
 		.await
 	}
 
-	pub(super) async fn relink(
+	pub async fn relink(
 		&mut self,
 		library_id: LibraryId,
 		location_path: impl AsRef<Path>,
@@ -139,7 +145,7 @@ impl SpacedriveLocationMetadataFile {
 		self.write_metadata().await
 	}
 
-	pub(super) async fn update(
+	pub async fn update(
 		&mut self,
 		library_id: LibraryId,
 		location_name: String,
@@ -156,7 +162,7 @@ impl SpacedriveLocationMetadataFile {
 		self.write_metadata().await
 	}
 
-	pub(super) async fn add_library(
+	pub async fn add_library(
 		&mut self,
 		library_id: LibraryId,
 		location_pub_id: Uuid,
@@ -178,18 +184,22 @@ impl SpacedriveLocationMetadataFile {
 		self.write_metadata().await
 	}
 
-	pub(super) fn has_library(&self, library_id: LibraryId) -> bool {
+	pub fn has_library(&self, library_id: LibraryId) -> bool {
 		self.metadata.libraries.contains_key(&library_id)
 	}
 
-	pub(super) fn location_path(&self, library_id: LibraryId) -> Option<&Path> {
+	pub fn location_path(&self, library_id: LibraryId) -> Option<&Path> {
 		self.metadata
 			.libraries
 			.get(&library_id)
 			.map(|l| l.path.as_path())
 	}
 
-	pub(super) async fn remove_library(
+	pub fn is_empty(&self) -> bool {
+		self.metadata.libraries.is_empty()
+	}
+
+	pub async fn remove_library(
 		&mut self,
 		library_id: LibraryId,
 	) -> Result<(), LocationMetadataError> {
@@ -209,10 +219,31 @@ impl SpacedriveLocationMetadataFile {
 		}
 	}
 
-	pub(super) fn location_pub_id(
-		&self,
-		library_id: LibraryId,
-	) -> Result<Uuid, LocationMetadataError> {
+	pub async fn clean_stale_libraries(
+		&mut self,
+		existing_libraries_ids: &HashSet<LibraryId>,
+	) -> Result<(), LocationMetadataError> {
+		let previous_libraries_count = self.metadata.libraries.len();
+		self.metadata
+			.libraries
+			.retain(|library_id, _| existing_libraries_ids.contains(library_id));
+
+		if self.metadata.libraries.len() != previous_libraries_count {
+			self.metadata.updated_at = Utc::now();
+
+			if !self.metadata.libraries.is_empty() {
+				self.write_metadata().await
+			} else {
+				fs::remove_file(&self.path)
+					.await
+					.map_err(|e| LocationMetadataError::Delete(e, self.path.clone()))
+			}
+		} else {
+			Ok(())
+		}
+	}
+
+	pub fn location_pub_id(&self, library_id: LibraryId) -> Result<Uuid, LocationMetadataError> {
 		self.metadata
 			.libraries
 			.get(&library_id)
@@ -221,13 +252,27 @@ impl SpacedriveLocationMetadataFile {
 	}
 
 	async fn write_metadata(&self) -> Result<(), LocationMetadataError> {
-		fs::write(
-			&self.path,
-			serde_json::to_vec(&self.metadata)
-				.map_err(|e| LocationMetadataError::Serialize(e, self.path.clone()))?,
-		)
-		.await
-		.map_err(|e| LocationMetadataError::Write(e, self.path.clone()))
+		let mut file_options = OpenOptions::new();
+
+		// we want to write the file if it exists, otherwise create it
+		file_options.create(true).write(true);
+
+		#[cfg(target_os = "windows")]
+		{
+			use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+			file_options.attributes(FILE_ATTRIBUTE_HIDDEN.0);
+		}
+
+		let metadata_contents = serde_json::to_vec(&self.metadata)
+			.map_err(|e| LocationMetadataError::Serialize(e, self.path.clone()))?;
+
+		file_options
+			.open(&self.path)
+			.await
+			.map_err(|e| LocationMetadataError::Write(e, self.path.clone()))?
+			.write_all(&metadata_contents)
+			.await
+			.map_err(|e| LocationMetadataError::Write(e, self.path.clone()))
 	}
 }
 
@@ -245,6 +290,6 @@ pub enum LocationMetadataError {
 	Write(io::Error, PathBuf),
 	#[error("Failed to deserialize metadata file for location (at path: {1:?}); (error: {0:?})")]
 	Deserialize(serde_json::Error, PathBuf),
-	#[error("Failed to relink, as the new location path is the same as the old path")]
+	#[error("Failed to relink, as the new location path is the same as the old path: {0}")]
 	RelinkSamePath(PathBuf),
 }

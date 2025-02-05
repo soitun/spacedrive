@@ -24,6 +24,7 @@ extension_enum! {
 		Code(CodeExtension),
 		Database(DatabaseExtension),
 		Book(BookExtension),
+		Config(ConfigExtension),
 	}
 }
 
@@ -31,6 +32,7 @@ extension_enum! {
 extension_category_enum! {
 	VideoExtension ALL_VIDEO_EXTENSIONS {
 		Avi = [0x52, 0x49, 0x46, 0x46, _, _, _, _, 0x41, 0x56, 0x49, 0x20],
+		Avifs = [],
 		Qt = [0x71, 0x74, 0x20, 0x20],
 		Mov = [0x66, 0x74, 0x79, 0x70, 0x71, 0x74, 0x20, 0x20] + 4,
 		Swf = [0x5A, 0x57, 0x53] | [0x46, 0x57, 0x53],
@@ -76,6 +78,13 @@ extension_category_enum! {
 		Svg = [0x3C, 0x73, 0x76, 0x67],
 		Ico = [0x00, 0x00, 0x01, 0x00],
 		Heic = [0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63],
+		Heics  = [0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63],
+		Heif = [],
+		Heifs = [],
+		Hif = [],
+		Avif = [],
+		Avci = [],
+		Avcs = [],
 		Raw = [],
 		Akw = [0x41, 0x4B, 0x57, 0x42],
 		Dng = [0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x44, 0x4E, 0x47, 0x00],
@@ -90,7 +99,7 @@ extension_category_enum! {
 
 // audio extensions
 extension_category_enum! {
-	AudioExtension _ALL_AUDIO_EXTENSIONS {
+	AudioExtension ALL_AUDIO_EXTENSIONS {
 		Mp3 = [0x49, 0x44, 0x33],
 		Mp2 = [0xFF, 0xFB] | [0xFF, 0xFD],
 		M4a = [0x66, 0x74, 0x79, 0x70, 0x4D, 0x34, 0x41, 0x20] + 4,
@@ -112,6 +121,7 @@ extension_category_enum! {
 		Aptx = [0x4B, 0xBF, 0x4B, 0xBF],
 		Adts = [0xFF, 0xF1],
 		Ast = [0x53, 0x54, 0x52, 0x4D],
+		Mid = [0x4D, 0x54, 0x68, 0x64],
 	}
 }
 
@@ -148,7 +158,7 @@ extension_category_enum! {
 
 // document extensions
 extension_category_enum! {
-	DocumentExtension _ALL_DOCUMENT_EXTENSIONS {
+	DocumentExtension ALL_DOCUMENT_EXTENSIONS {
 		Pdf = [0x25, 0x50, 0x44, 0x46, 0x2D],
 		Key = [0x50, 0x4B, 0x03, 0x04],
 		Pages = [0x50, 0x4B, 0x03, 0x04],
@@ -173,13 +183,24 @@ extension_category_enum! {
 		Txt,
 		Rtf,
 		Md,
+		Markdown,
+	}
+}
+// config file extensions
+extension_category_enum! {
+	ConfigExtension _ALL_CONFIG_EXTENSIONS {
+		Ini,
 		Json,
 		Yaml,
 		Yml,
 		Toml,
 		Xml,
+		Mathml,
+		Rss,
 		Csv,
 		Cfg,
+		Compose,
+		Tsconfig,
 	}
 }
 
@@ -228,34 +249,99 @@ extension_category_enum! {
 // code extensions
 extension_category_enum! {
 	CodeExtension _ALL_CODE_EXTENSIONS {
-		Rs,
-		Ts,
-		Tsx,
-		Js,
-		Jsx,
-		Vue,
-		Php,
-		Py,
-		Rb,
+		// AppleScript
+		Scpt,
+		Scptd,
+		Applescript,
+		// Shell script
 		Sh,
-		Html,
-		Css,
-		Sass,
-		Scss,
-		Less,
-		Bash,
 		Zsh,
+		Fish,
+		Bash,
+		// C, C++
 		C,
 		Cpp,
 		H,
 		Hpp,
-		Java,
-		Scala,
-		Go,
+		// Ruby
+		Rb,
+		// Javascript
+		Js,
+		Mjs,
+		Jsx,
+		// Markup
+		Html,
+		// Stylesheet
+		Css,
+		Sass,
+		Scss,
+		Less,
+		// Crystal
+		Cr,
+		// C#
+		Cs,
+		Csx,
+		D,
 		Dart,
+		// Docker
+		Dockerfile,
+		Go,
+		// Haskell
+		Hs,
+		Java,
+		// Kotlin
+		Kt,
+		Kts,
+		Lua,
+		// Makefile
+		Make,
+		Nim,
+		Nims,
+		// Objective-C
+		M,
+		Mm,
+		// Ocaml
+		Ml,
+		Mli,
+		Mll,
+		Mly,
+		// Perl
+		Pl,
+		// PHP
+		Php,
+		Php1,
+		Php2,
+		Php3,
+		Php4,
+		Php5,
+		Php6,
+		Phps,
+		Phpt,
+		Phtml,
+		// Powershell
+		Ps1,
+		Psd1,
+		Psm1,
+		// Python
+		Py,
+		Qml,
+		R,
+		// Rust
+		Rs,
+		// Solidity
+		Sol,
+		Sql,
 		Swift,
+		// Typescript
+		Ts,
+		Tsx,
+		Vala,
+		Zig,
+		Vue,
+		Scala,
 		Mdx,
 		Astro,
+		Mts,
 	}
 }
 
@@ -306,7 +392,7 @@ mod test {
 	#[tokio::test]
 	async fn magic_bytes() {
 		async fn test_path(subpath: &str) -> Option<Extension> {
-			println!("testing {}...", subpath);
+			println!("testing {subpath}...");
 			Extension::resolve_conflicting(subpath.split('.').last().unwrap(), true).await
 		}
 		// Video extension tests

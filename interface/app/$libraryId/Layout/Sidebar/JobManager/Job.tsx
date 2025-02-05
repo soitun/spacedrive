@@ -1,195 +1,116 @@
-import clsx from 'clsx';
 import {
-	Camera,
 	Copy,
-	Eye,
 	Fingerprint,
 	Folder,
-	LockSimple,
-	LockSimpleOpen,
-	Question,
+	Icon,
+	Image,
+	Info,
+	Lightning,
 	Scissors,
-	Trash,
-	TrashSimple
-} from 'phosphor-react';
+	Trash
+} from '@phosphor-icons/react';
 import { memo } from 'react';
-import { JobReport } from '@sd/client';
+import { JobName, JobProgressEvent, Report, useJobInfo } from '@sd/client';
 import { ProgressBar } from '@sd/ui';
-import './Job.scss';
-import { useJobTimeText } from './useJobTimeText';
+import { showAlertDialog } from '~/components';
+import { useLocale } from '~/hooks';
 
-interface JobNiceData {
-	name: string;
-	icon: React.ForwardRefExoticComponent<any>;
-	filesDiscovered: string;
-}
-
-const getNiceData = (
-	job: JobReport,
-	isGroup: boolean | undefined
-): Record<string, JobNiceData> => ({
-	indexer: {
-		name: isGroup
-			? 'Indexing paths'
-			: job.metadata?.location_path
-			? `Indexed paths at ${job.metadata?.location_path} `
-			: `Processing added location...`,
-		icon: Folder,
-		filesDiscovered: `${numberWithCommas(
-			job.metadata?.total_paths || 0
-		)} ${JobCountTextCondition(job, 'path')}`
-	},
-	thumbnailer: {
-		name: `${
-			job.status === 'Running' || job.status === 'Queued'
-				? 'Generating thumbnails'
-				: 'Generated thumbnails'
-		}`,
-		icon: Camera,
-		filesDiscovered: `${numberWithCommas(job.task_count)} ${JobCountTextCondition(job, 'item')}`
-	},
-	file_identifier: {
-		name: `${
-			job.status === 'Running' || job.status === 'Queued'
-				? 'Extracting metadata'
-				: 'Extracted metadata'
-		}`,
-		icon: Eye,
-		filesDiscovered:
-			job.message ||
-			`${numberWithCommas(job.task_count)} ${JobCountTextCondition(job, 'item')}`
-	},
-	object_validator: {
-		name: `Generated full object hashes`,
-		icon: Fingerprint,
-		filesDiscovered: `${numberWithCommas(job.task_count)} ${JobCountTextCondition(
-			job,
-			'object'
-		)}`
-	},
-	file_encryptor: {
-		name: `Encrypted`,
-		icon: LockSimple,
-		filesDiscovered: `${numberWithCommas(job.task_count)} ${JobCountTextCondition(job, 'file')}`
-	},
-	file_decryptor: {
-		name: `Decrypted`,
-		icon: LockSimpleOpen,
-		filesDiscovered: `${numberWithCommas(job.task_count)}${JobCountTextCondition(job, 'file')}`
-	},
-	file_eraser: {
-		name: `Securely erased`,
-		icon: TrashSimple,
-		filesDiscovered: `${numberWithCommas(job.task_count)} ${JobCountTextCondition(job, 'file')}`
-	},
-	file_deleter: {
-		name: `Deleted`,
-		icon: Trash,
-		filesDiscovered: `${numberWithCommas(job.task_count)} ${JobCountTextCondition(job, 'file')}`
-	},
-	file_copier: {
-		name: `Copied`,
-		icon: Copy,
-		filesDiscovered: `${numberWithCommas(job.task_count)} ${JobCountTextCondition(job, 'file')}`
-	},
-	file_cutter: {
-		name: `Moved`,
-		icon: Scissors,
-		filesDiscovered: `${numberWithCommas(job.task_count)} ${JobCountTextCondition(job, 'file')}`
-	}
-});
-
-const StatusColors: Record<JobReport['status'], string> = {
-	Running: 'text-blue-500',
-	Failed: 'text-red-500',
-	Completed: 'text-green-500',
-	CompletedWithErrors: 'text-orange-500',
-	Queued: 'text-yellow-500',
-	Canceled: 'text-gray-500',
-	Paused: 'text-gray-500'
-};
+import JobContainer from './JobContainer';
 
 interface JobProps {
-	job: JobReport;
-	clearJob?: (arg: string) => void;
+	job: Report;
 	className?: string;
-	isGroup?: boolean;
+	isChild?: boolean;
+	progress: JobProgressEvent | null;
+	eta: number;
 }
 
-function Job({ job, clearJob, className, isGroup }: JobProps) {
-	const niceData = getNiceData(job, isGroup)[job.name] || {
-		name: job.name,
-		icon: Question,
-		filesDiscovered: job.name
-	};
-	const isRunning = job.status === 'Running';
+export const JobIcon: Record<JobName, Icon> = {
+	Indexer: Folder,
+	MediaProcessor: Image,
+	FileIdentifier: Fingerprint,
+	Copy: Copy,
+	Delete: Trash,
+	Erase: Trash,
+	Move: Scissors,
+	FileValidator: Fingerprint
+};
 
-	const time = useJobTimeText(job);
+// Jobs like deleting and copying files do not have simplied job names
+// so we need to use the metadata to display an icon
+const MetaDataJobIcon = {
+	deleter: Trash,
+	copier: Copy
+};
+
+function Job({ job, className, isChild, progress, eta }: JobProps) {
+	const jobData = useJobInfo(job, progress);
+	const { t } = useLocale();
+	// I don't like sending TSX as a prop due to lack of hot-reload, but it's the only way to get the error log to show up
+	if (job.status === 'CompletedWithErrors') {
+		const JobError = (
+			<pre className="custom-scroll inspector-scroll max-h-[300px] rounded border border-app-darkBox bg-app-darkBox/80 p-3">
+				{job.non_critical_errors.map((error, i) => (
+					<p
+						className="mb-1 w-full overflow-auto whitespace-normal break-words text-sm"
+						key={i}
+					>
+						{/* TODO: Report errors in a nicer way */}
+						{JSON.stringify(error)}
+					</p>
+				))}
+			</pre>
+		);
+		jobData.textItems?.push([
+			{
+				text: t('completed_with_errors'),
+				icon: Info,
+				onClick: () => {
+					showAlertDialog({
+						title: t('error'),
+						description: t('job_error_description'),
+						children: JobError
+					});
+				}
+			}
+		]);
+	}
+
+	let jobIcon = Lightning;
+	if (job.name in JobIcon) {
+		jobIcon = JobIcon[job.name];
+	} else {
+		const meta = [...jobData.meta, ...jobData.output].find(
+			(meta) => meta.type in MetaDataJobIcon
+		);
+		if (meta) {
+			jobIcon = MetaDataJobIcon[meta.type as keyof typeof MetaDataJobIcon];
+		}
+	}
 
 	return (
-		<li
-			className={clsx(
-				`removelistdot border-b border-app-line/50 pl-4`,
-				className,
-				isGroup ? `joblistitem pr-3 pt-0` : 'p-3'
-			)}
+		<JobContainer
+			className={className}
+			name={jobData.name}
+			icon={jobIcon}
+			eta={eta}
+			status={job.status}
+			textItems={
+				['Queued'].includes(job.status) ? [[{ text: job.status }]] : jobData.textItems
+			}
+			isChild={isChild}
 		>
-			<div className="ml-7 flex">
-				<div>
-					<niceData.icon
-						className={clsx(
-							'relative top-2 mr-3 h-6 w-6 rounded-full bg-app-button p-[5.5px]'
-						)}
+			{(jobData.isRunning || jobData.isPaused) && (
+				<div className="my-1 ml-1.5 w-[335px]">
+					<ProgressBar
+						pending={jobData.taskCount == 0}
+						value={jobData.completedTaskCount}
+						total={jobData.taskCount}
 					/>
 				</div>
-				<div className="flex w-full flex-col">
-					<div className="flex items-center">
-						<div className="truncate">
-							<span className="truncate font-semibold">{niceData.name}</span>
-							<p className="mb-[5px] mt-[2px] flex gap-1 truncate text-ink-faint">
-								{job.status === 'Queued' && <p>{job.status}:</p>}
-								{niceData.filesDiscovered}
-								{time && ' • '}
-								<span className="truncate">{time}</span>
-							</p>
-							<div className="flex gap-1 truncate text-ink-faint"></div>
-						</div>
-						<div className="grow" />
-						<div className="ml-7 flex flex-row space-x-2">
-							{/* {job.status === 'Running' && (
-						<Button size="icon">
-							<Tooltip label="Coming Soon">
-								<Pause weight="fill" className="w-4 h-4 opacity-30" />
-							</Tooltip>
-						</Button>
-					)}
-					{job.status === 'Failed' && (
-						<Button size="icon">
-							<Tooltip label="Coming Soon">
-								<ArrowsClockwise className="w-4 opacity-30" />
-							</Tooltip>
-						</Button>
-					)} */}
-						</div>
-					</div>
-					{isRunning && (
-						<div className="my-1 w-[335px]">
-							<ProgressBar value={job.completed_task_count} total={job.task_count} />
-						</div>
-					)}
-				</div>
-			</div>
-		</li>
+			)}
+		</JobContainer>
 	);
-}
-
-function JobCountTextCondition(job: JobReport, word: string) {
-	const addStoEnd = job.task_count > 1 || job?.task_count === 0 ? `${word}s` : `${word}`;
-	return addStoEnd;
-}
-
-function numberWithCommas(x: number) {
-	return x.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
 export default memo(Job);

@@ -2,18 +2,20 @@ import dayjs from 'dayjs';
 import {
 	Barcode,
 	CaretLeft,
-	CircleWavyCheck,
 	Clock,
 	Cube,
+	FolderOpen,
 	Icon,
+	SealCheck,
 	Snowflake
 } from 'phosphor-react-native';
 import { forwardRef } from 'react';
 import { Pressable, Text, View } from 'react-native';
-import { ExplorerItem, formatBytes, isObject, useLibraryQuery } from '@sd/client';
+import { getItemFilePath, getItemObject, humanizeSize, type ExplorerItem } from '@sd/client';
 import FileThumb from '~/components/explorer/FileThumb';
 import InfoTagPills from '~/components/explorer/sections/InfoTagPills';
-import { Modal, ModalRef, ModalScrollView } from '~/components/layout/Modal';
+import { Modal, ModalScrollView, type ModalRef } from '~/components/layout/Modal';
+import VirtualizedListWrapper from '~/components/layout/VirtualizedListWrapper';
 import { Divider } from '~/components/primitive/Divider';
 import useForwardedRef from '~/hooks/useForwardedRef';
 import { tw } from '~/lib/tailwind';
@@ -47,18 +49,9 @@ type FileInfoModalProps = {
 
 const FileInfoModal = forwardRef<ModalRef, FileInfoModalProps>((props, ref) => {
 	const { data } = props;
-
 	const modalRef = useForwardedRef(ref);
-
-	const item = data?.item;
-
-	const objectData = data ? (isObject(data) ? data.item : data.item.object) : null;
-	const filePathData = data ? (isObject(data) ? data.item.file_paths[0] : data.item) : null;
-
-	const fullObjectData = useLibraryQuery(['files.get', { id: objectData?.id || -1 }], {
-		enabled: objectData?.id !== undefined
-	});
-
+	const filePathData = data && getItemFilePath(data);
+	const objectData = data && getItemObject(data);
 	return (
 		<Modal
 			ref={modalRef}
@@ -66,76 +59,92 @@ const FileInfoModal = forwardRef<ModalRef, FileInfoModalProps>((props, ref) => {
 			enablePanDownToClose={false}
 			snapPoints={['70']}
 		>
-			{data && (
-				<ModalScrollView style={tw`flex-1 p-4`}>
-					{/* Back Button */}
-					<Pressable
-						onPress={() => modalRef.current?.close()}
-						style={tw`absolute z-10 ml-4`}
-					>
-						<CaretLeft color={tw.color('accent')} size={20} weight="bold" />
-					</Pressable>
-					{/* File Icon / Name */}
-					<View style={tw`items-center`}>
-						<FileThumb data={data} size={1.6} />
-						<Text style={tw`mt-2 text-base font-bold text-gray-200`}>
-							{filePathData?.name}
-						</Text>
-						<InfoTagPills data={data} style={tw`mt-3`} />
-					</View>
-					{/* Details */}
-					<Divider style={tw`mb-4 mt-6`} />
-					<>
-						{/* Size */}
-						<MetaItem
-							title="Size"
-							icon={Cube}
-							value={formatBytes(Number(filePathData?.size_in_bytes || 0))}
-						/>
-						{/* Duration */}
-						{fullObjectData.data?.media_data?.duration_seconds && (
-							<MetaItem
-								title="Duration"
-								value={fullObjectData.data.media_data.duration_seconds}
-								icon={Clock}
+			<VirtualizedListWrapper style={tw`flex-col p-4`} scrollEnabled={false} horizontal>
+				{data && (
+					<ModalScrollView>
+						{/* Back Button */}
+						<Pressable
+							onPress={() => modalRef.current?.close()}
+							style={tw`absolute left-2 z-10 rounded-full bg-app-button p-2`}
+						>
+							<CaretLeft color={tw.color('ink')} size={16} weight="bold" />
+						</Pressable>
+						<View style={tw`items-center`}>
+							{/* File Icon / Name */}
+							<FileThumb data={data} size={1.6} />
+							<Text style={tw`text-base font-bold text-gray-200`}>
+								{filePathData?.name}
+							</Text>
+							<InfoTagPills
+								columnCount={4}
+								contentContainerStyle={tw`mx-auto`}
+								data={data}
+								style={tw`mt-5 items-center`}
 							/>
-						)}
-						{/* Created */}
-						<MetaItem
-							icon={Clock}
-							title="Created"
-							value={dayjs(item?.date_created).format('MMM Do YYYY')}
-						/>
-						{/* Indexed */}
-						<MetaItem
-							icon={Barcode}
-							title="Indexed"
-							value={dayjs(filePathData?.date_indexed).format('MMM Do YYYY')}
-						/>
+						</View>
+						{/* Details */}
+						<Divider style={tw`mb-4 mt-3`} />
+						<>
+							{/* Size */}
+							<MetaItem
+								title="Size"
+								icon={Cube}
+								value={`${humanizeSize(filePathData?.size_in_bytes_bytes)}`}
+							/>
+							{/* Created */}
+							{data.type !== 'SpacedropPeer' && (
+								<MetaItem
+									icon={Clock}
+									title="Created"
+									value={dayjs(data.item.date_created).format('MMM Do YYYY')}
+								/>
+							)}
 
-						{filePathData && (
-							<>
-								{/* TODO: Note */}
-								{filePathData.cas_id && (
+							{/* Accessed */}
+							<MetaItem
+								icon={FolderOpen}
+								title="Accessed"
+								value={
+									objectData?.date_accessed
+										? dayjs(objectData.date_accessed).format('MMM Do YYYY')
+										: '--'
+								}
+							/>
+
+							{/* Modified */}
+
+							{filePathData && 'cas_id' in filePathData && (
+								<>
+									{/* Indexed */}
 									<MetaItem
-										icon={Snowflake}
-										title="Content ID"
-										value={filePathData.cas_id}
+										icon={Barcode}
+										title="Indexed"
+										value={dayjs(filePathData.date_indexed).format(
+											'MMM Do YYYY'
+										)}
 									/>
-								)}
-								{/* Checksum */}
-								{filePathData?.integrity_checksum && (
-									<MetaItem
-										icon={CircleWavyCheck}
-										title="Checksum"
-										value={filePathData?.integrity_checksum}
-									/>
-								)}
-							</>
-						)}
-					</>
-				</ModalScrollView>
-			)}
+									{/* TODO: Note */}
+									{filePathData.cas_id && (
+										<MetaItem
+											icon={Snowflake}
+											title="Content ID"
+											value={filePathData.cas_id}
+										/>
+									)}
+									{/* Checksum */}
+									{filePathData?.integrity_checksum && (
+										<MetaItem
+											icon={SealCheck}
+											title="Checksum"
+											value={filePathData?.integrity_checksum}
+										/>
+									)}
+								</>
+							)}
+						</>
+					</ModalScrollView>
+				)}
+			</VirtualizedListWrapper>
 		</Modal>
 	);
 });

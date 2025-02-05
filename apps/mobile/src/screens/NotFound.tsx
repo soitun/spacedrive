@@ -10,7 +10,7 @@ export default function NotFoundScreen({ navigation }: RootStackScreenProps<'Not
 				onPress={() =>
 					navigation.replace('Root', {
 						screen: 'Home',
-						params: { screen: 'OverviewStack', params: { screen: 'Overview' } }
+						params: { screen: 'BrowseStack', params: { screen: 'Browse' } }
 					})
 				}
 				style={tw`mt-4 py-4`}

@@ -1,4 +1,4 @@
-import { CaretLeft } from 'phosphor-react';
+import { CaretLeft } from '@phosphor-icons/react';
 import { PropsWithChildren } from 'react';
 import { useNavigate } from 'react-router';
 import { Button, Divider, tw } from '@sd/ui';
@@ -8,7 +8,7 @@ interface Props extends PropsWithChildren {
 	topRight?: React.ReactNode;
 }
 
-const PageOuter = tw.div`flex h-screen flex-col m-3 -mt-4`;
+const PageOuter = tw.div`flex h-screen flex-col px-3 pt-4`;
 const Page = tw.div`flex-1 w-full border rounded-md shadow-md shadow-app-shade/30 border-app-box bg-app-box/20`;
 const PageInner = tw.div`flex flex-col max-w-4xl w-full h-screen py-6`;
 const HeaderArea = tw.div`flex flex-row px-8 items-center space-x-4 mb-2`;
@@ -37,8 +37,8 @@ const BackButton = () => {
 
 	return (
 		<Button variant="outline" size="icon" onClick={() => navigate(-1)}>
-			<div className="flex h-4 w-4 justify-center">
-				<CaretLeft weight="bold" className="w-[12px] text-ink-dull " aria-hidden="true" />
+			<div className="flex size-4 justify-center">
+				<CaretLeft weight="bold" className="w-[12px] text-ink-dull" aria-hidden="true" />
 			</div>
 		</Button>
 	);

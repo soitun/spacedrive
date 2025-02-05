@@ -1,40 +1,90 @@
 [package]
-name = "spacedrive"
-version = "0.1.0"
-description = "The universal file manager."
-authors = ["Spacedrive Technology Inc."]
-license = ""
-repository = "https://github.com/spacedriveapp/spacedrive"
-default-run = "spacedrive"
-edition = "2021"
+name    = "sd-desktop"
+version = "0.4.3"
+
+authors              = ["Spacedrive Technology Inc <support@spacedrive.com>"]
+default-run          = "sd-desktop"
+description          = "The universal file manager."
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
 
 [dependencies]
-tauri = { version = "1.3.0", features = ["api-all", "linux-protocol-headers", "macos-private-api"] }
-rspc = { workspace = true, features = ["tauri"] }
-httpz = { workspace = true, features = ["axum", "tauri"] } # TODO: The `axum` feature should be only enabled on Linux but this currently can't be done: https://github.com/rust-lang/cargo/issues/1197
-sd-core = { path = "../../../core", features = ["ffmpeg", "location-watcher"] }
-tokio = { workspace = true, features = ["sync"] }
-window-shadows = "0.2.0"
-tracing = "0.1.36"
-serde = "1.0.145"
-percent-encoding = "2.2.0"
-http = "0.2.8"
-opener = "0.6.1"
-specta.workspace = true
-tauri-specta = { version = "1.0.0", features = ["typescript"] }
-uuid = { version = "1.1.2", features = ["serde"] }
+# Spacedrive Sub-crates
+sd-core   = { path = "../../../core", features = ["ffmpeg", "heif"] }
+sd-fda    = { path = "../../../crates/fda" }
+sd-prisma = { path = "../../../crates/prisma" }
+
+# Workspace dependencies
+axum               = { workspace = true, features = ["query"] }
+axum-extra         = { workspace = true, features = ["typed-header"] }
+base64             = { workspace = true }
+futures            = { workspace = true }
+http               = { workspace = true }
+hyper              = { workspace = true }
+prisma-client-rust = { workspace = true }
+rand               = { workspace = true }
+rspc               = { workspace = true, features = ["tauri"] }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+specta             = { workspace = true }
+strum              = { workspace = true, features = ["derive"] }
+thiserror          = { workspace = true }
+tokio              = { workspace = true, features = ["sync"] }
+tracing            = { workspace = true }
+uuid               = { workspace = true, features = ["serde"] }
+
+# Specific Desktop dependencies
+# WARNING: Do NOT enable default features, as that vendors dbus (see below)
+drag                           = { git = "https://github.com/spacedriveapp/drag-rs", branch = "move-operation" }
+opener                         = { version = "0.7.1", features = ["reveal"], default-features = false }
+specta-typescript              = "=0.0.7"
+tauri-plugin-clipboard-manager = "=2.0.1"
+tauri-plugin-cors-fetch        = { path = "../../../crates/tauri-plugin-cors-fetch" }
+tauri-plugin-deep-link         = "=2.0.1"
+tauri-plugin-dialog            = "=2.0.3"
+tauri-plugin-drag              = "2.0.0"
+tauri-plugin-http              = "=2.0.3"
+tauri-plugin-os                = "=2.0.1"
+tauri-plugin-shell             = "=2.0.2"
+tauri-plugin-updater           = "=2.0.2"
+
+# memory allocator
+mimalloc = { workspace = true }
+
+[dependencies.tauri]
+features = ["linux-libxdo", "macos-private-api", "native-tls-vendored", "unstable"]
+version  = "=2.0.6"
+
+[dependencies.tauri-specta]
+features = ["derive", "typescript"]
+git      = "https://github.com/spacedriveapp/tauri-specta"
+rev      = "8c85d40eb9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-axum = { version = "0.6.4", features = ["headers", "query"] }
-rand = "0.8.5"
+# Spacedrive Sub-crates
+sd-desktop-linux = { path = "../crates/linux" }
+
+# Specific Desktop dependencies
+# WARNING: dbus must NOT be vendored, as that breaks the app on Linux,X11,Nvidia
+dbus = { version = "0.9.7", features = ["stdfd"] }
+# https://github.com/tauri-apps/tauri/blob/tauri-v2.0.0/crates/tauri/Cargo.toml#L101
+webkit2gtk = { version = "=2.0.1", features = ["v2_40"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-sd-desktop-macos.path = "../crates/macos"
+# Spacedrive Sub-crates
+sd-desktop-macos = { path = "../crates/macos" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Spacedrive Sub-crates
+sd-desktop-windows = { path = "../crates/windows" }
 
 [build-dependencies]
-tauri-build = { version = "1.3.0", features = [] }
+# Specific Desktop dependencies
+tauri-build = "=2.0.2"
 
 [features]
-default = ["custom-protocol"]
-updater = ["tauri/updater"]
+ai-models       = ["sd-core/ai"]
 custom-protocol = ["tauri/custom-protocol"]
+default         = ["custom-protocol"]
+devtools        = ["tauri/devtools"]

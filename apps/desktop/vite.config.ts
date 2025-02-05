@@ -1,4 +1,6 @@
-import { Plugin, mergeConfig } from 'vite';
+import { sentryVitePlugin } from '@sentry/vite-plugin';
+import { defineConfig, loadEnv, mergeConfig, Plugin } from 'vite';
+
 import baseConfig from '../../packages/config/vite';
 
 const devtoolsPlugin: Plugin = {
@@ -16,9 +18,31 @@ const devtoolsPlugin: Plugin = {
 	}
 };
 
-export default mergeConfig(baseConfig, {
-	server: {
-		port: 8001
-	},
-	plugins: [devtoolsPlugin]
+export default defineConfig(({ mode }) => {
+	process.env = { ...process.env, ...loadEnv(mode, process.cwd(), '') };
+
+	return mergeConfig(baseConfig, {
+		server: {
+			port: 8001
+		},
+		build: {
+			rollupOptions: {
+				treeshake: 'recommended',
+				external: [
+					// Don't bundle Fda video for non-macOS platforms
+					process.platform !== 'darwin' && /^@sd\/assets\/videos\/Fda.mp4$/
+				].filter(Boolean)
+			}
+		},
+		plugins: [
+			devtoolsPlugin,
+			process.env.SENTRY_AUTH_TOKEN &&
+				// All this plugin does is give Sentry access to source maps and release data for errors that users *choose* to report
+				sentryVitePlugin({
+					authToken: process.env.SENTRY_AUTH_TOKEN,
+					org: 'spacedriveapp',
+					project: 'desktop'
+				})
+		]
+	});
 });

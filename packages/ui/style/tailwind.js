@@ -1,5 +1,3 @@
-// const colors = require('tailwindcss/colors');
-const plugin = require('tailwindcss/plugin');
 const defaultTheme = require('tailwindcss/defaultTheme');
 
 function alpha(variableName) {
@@ -9,22 +7,27 @@ function alpha(variableName) {
 }
 
 module.exports = function (app, options) {
+	/**
+	 * @type {import('tailwindcss').Config}
+	 */
 	let config = {
 		content: [
 			`../../apps/${app}/src/**/*.{ts,tsx,html,stories.tsx}`,
 			'../../packages/*/src/**/*.{ts,tsx,html,stories.tsx}',
 			'../../interface/**/*.{ts,tsx,html,stories.tsx}'
 		],
-		darkMode: app == 'landing' ? 'class' : 'media',
-		mode: 'jit',
+		darkMode: 'class',
 		theme: {
 			screens: {
 				xs: '475px',
 				sm: '650px',
 				md: '868px',
 				lg: '1024px',
-				xl: '1280px',
-				...defaultTheme.screens
+				xl: '1280px'
+			},
+			fontFamily: {
+				sans: [...defaultTheme.fontFamily.sans],
+				plex: ['IBM Plex Sans', ...defaultTheme.fontFamily.sans]
 			},
 			fontSize: {
 				'tiny': '.65rem',
@@ -56,6 +59,9 @@ module.exports = function (app, options) {
 						DEFAULT: alpha('--color-sidebar'),
 						box: alpha('--color-sidebar-box'),
 						line: alpha('--color-sidebar-line'),
+						ink: alpha('--color-sidebar-ink'),
+						inkFaint: alpha('--color-sidebar-ink-faint'),
+						inkDull: alpha('--color-sidebar-ink-dull'),
 						divider: alpha('--color-sidebar-divider'),
 						button: alpha('--color-sidebar-button'),
 						selected: alpha('--color-sidebar-selected'),
@@ -65,6 +71,7 @@ module.exports = function (app, options) {
 						DEFAULT: alpha('--color-app'),
 						box: alpha('--color-app-box'),
 						darkBox: alpha('--color-app-dark-box'),
+						darkerBox: alpha('--color-app-darker-box'),
 						lightBox: alpha('--color-app-light-box'),
 						overlay: alpha('--color-app-overlay'),
 						input: alpha('--color-app-input'),
@@ -73,10 +80,13 @@ module.exports = function (app, options) {
 						divider: alpha('--color-app-divider'),
 						button: alpha('--color-app-button'),
 						selected: alpha('--color-app-selected'),
+						selectedItem: alpha('--color-app-selected-item'),
 						hover: alpha('--color-app-hover'),
 						active: alpha('--color-app-active'),
 						shade: alpha('--color-app-shade'),
-						frame: alpha('--color-app-frame')
+						frame: alpha('--color-app-frame'),
+						slider: alpha('--color-app-slider'),
+						explorerScrollbar: alpha('--color-app-explorer-scrollbar')
 					},
 					menu: {
 						DEFAULT: alpha('--color-menu'),
@@ -162,13 +172,17 @@ module.exports = function (app, options) {
 			require('@tailwindcss/forms'),
 			require('tailwindcss-animate'),
 			require('@headlessui/tailwindcss'),
-			require('tailwindcss-radix')()
+			require('tailwindcss-radix')(),
+			require('@tailwindcss/typography')
 		]
 	};
+
 	if (app === 'landing') {
-		config.plugins.push(require('@tailwindcss/typography'));
-		config.plugins.push(require('@tailwindcss/line-clamp'));
+		console.log('CONFIGURING TAILWIND for Landing');
+		config.theme.fontFamily.sans = ['var(--font-inter)', ...defaultTheme.fontFamily.sans];
+		config.theme.fontFamily.plex = ['var(--font-plex-sans)', ...defaultTheme.fontFamily.sans];
 	}
+
 	return config;
 };
 

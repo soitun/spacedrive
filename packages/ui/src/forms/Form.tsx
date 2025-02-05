@@ -1,16 +1,16 @@
-import { ErrorMessage as ErrorMessagePrimitive } from '@hookform/error-message';
-import { zodResolver } from '@hookform/resolvers/zod';
-import { VariantProps, cva } from 'class-variance-authority';
+import { Warning } from '@phosphor-icons/react';
+import { animated, useTransition } from '@react-spring/web';
+import { cva, VariantProps } from 'class-variance-authority';
 import { ComponentProps } from 'react';
 import {
+	FieldErrors,
 	FieldValues,
 	FormProvider,
+	get,
+	useFormContext,
 	UseFormHandleSubmit,
-	UseFormProps,
-	UseFormReturn,
-	useForm
+	UseFormReturn
 } from 'react-hook-form';
-import { z } from 'zod';
 
 export interface FormProps<T extends FieldValues> extends Omit<ComponentProps<'form'>, 'onSubmit'> {
 	form: UseFormReturn<T>;
@@ -30,54 +30,71 @@ export const Form = <T extends FieldValues>({
 			<form
 				onSubmit={(e) => {
 					e.stopPropagation();
+					e.preventDefault();
 					return onSubmit?.(e);
 				}}
 				{...props}
 			>
-				{/* <fieldset> passes the form's 'disabled' state to all of its elements,
-            allowing us to handle disabled style variants with just css */}
-				<fieldset disabled={disabled || form.formState.isSubmitting}>{children}</fieldset>
+				{/**
+				 * <fieldset> passes the form's 'disabled' state to all of its elements,
+				 * allowing us to handle disabled style variants with just css.
+				 * <fieldset> has a default `min-width: min-content`, which causes it to behave weirdly,
+				 * so we override it.
+				 */}
+				<fieldset disabled={disabled || form.formState.isSubmitting} className="min-w-0">
+					{children}
+				</fieldset>
 			</form>
 		</FormProvider>
 	);
 };
 
-interface UseZodFormProps<S extends z.ZodSchema>
-	extends Exclude<UseFormProps<z.infer<S>>, 'resolver'> {
-	schema?: S;
-}
-
-export const useZodForm = <S extends z.ZodSchema = z.ZodObject<Record<string, never>>>(
-	props?: UseZodFormProps<S>
-) => {
-	const { schema, ...formProps } = props ?? {};
-
-	return useForm<z.infer<S>>({
-		...formProps,
-		resolver: zodResolver(schema || z.object({}))
-	});
-};
-
-export const errorStyles = cva('inline-block  whitespace-pre-wrap rounded border border-red-400/40 bg-red-400/40 text-white', {
-	variants: {
-		variant: {
-			none: '',
-			default: 'text-xs',
-			large: 'w-full px-3 py-2 text-center text-sm font-semibold'
+export const errorStyles = cva(
+	'flex justify-center gap-2 whitespace-normal break-words rounded border border-red-500/40 bg-red-800/40 px-3 py-2 text-white',
+	{
+		variants: {
+			variant: {
+				none: '',
+				default: 'w-full text-xs',
+				large: 'text-left text-xs font-semibold'
+			}
+		},
+		defaultVariants: {
+			variant: 'default'
 		}
-	},
-	defaultVariants: {
-		variant: 'default'
 	}
-});
+);
 
 export interface ErrorMessageProps extends VariantProps<typeof errorStyles> {
 	name: string;
 	className: string;
 }
 
-export const ErrorMessage = ({ name, variant, className }: ErrorMessageProps) => (
-	<ErrorMessagePrimitive as="span" name={name} className={errorStyles({ variant, className })} />
-);
+export const ErrorMessage = ({ name, variant, className }: ErrorMessageProps) => {
+	const methods = useFormContext();
+	const error = get(methods.formState.errors, name) as FieldErrors | undefined;
+	const transitions = useTransition(error, {
+		from: { opacity: 0 },
+		enter: { opacity: 1 },
+		leave: { opacity: 0 },
+		clamp: true,
+		config: { mass: 0.4, tension: 200, friction: 10, bounce: 0 },
+		exitBeforeEnter: true
+	});
+
+	return (
+		<>
+			{transitions((styles, error) => {
+				const message = error?.message;
+				return typeof message === 'string' ? (
+					<animated.div style={styles} className={errorStyles({ variant, className })}>
+						<Warning className="size-4" />
+						<p className="whitespace-normal">{message}</p>
+					</animated.div>
+				) : null;
+			})}
+		</>
+	);
+};
 
 export { z } from 'zod';

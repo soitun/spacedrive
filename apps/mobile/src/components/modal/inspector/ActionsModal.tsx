@@ -12,26 +12,37 @@ import {
 } from 'phosphor-react-native';
 import { PropsWithChildren, useRef } from 'react';
 import { Pressable, Text, View, ViewStyle } from 'react-native';
-import { formatBytes, isObject } from '@sd/client';
+import FileViewer from 'react-native-file-viewer';
+import {
+	getIndexedItemFilePath,
+	getItemObject,
+	humanizeSize,
+	useLibraryMutation,
+	useLibraryQuery,
+	useRspcContext
+} from '@sd/client';
 import FileThumb from '~/components/explorer/FileThumb';
 import FavoriteButton from '~/components/explorer/sections/FavoriteButton';
 import InfoTagPills from '~/components/explorer/sections/InfoTagPills';
 import { Modal, ModalRef } from '~/components/layout/Modal';
+import { toast } from '~/components/primitive/Toast';
 import { tw, twStyle } from '~/lib/tailwind';
 import { useActionsModalStore } from '~/stores/modalStore';
+
 import FileInfoModal from './FileInfoModal';
+import RenameModal from './RenameModal';
 
 type ActionsContainerProps = PropsWithChildren<{
 	style?: ViewStyle;
 }>;
 
 const ActionsContainer = ({ children, style }: ActionsContainerProps) => (
-	<View style={twStyle('rounded-lg bg-app-box py-3.5', style)}>{children}</View>
+	<View style={twStyle('rounded-lg border border-app-box bg-app py-3.5', style)}>{children}</View>
 );
 
 type ActionsItemProps = {
 	title: string;
-	icon: Icon;
+	icon?: Icon;
 	onPress?: () => void;
 	isDanger?: boolean;
 };
@@ -48,35 +59,73 @@ const ActionsItem = ({ icon, onPress, title, isDanger = false }: ActionsItemProp
 			>
 				{title}
 			</Text>
-			<Icon color={isDanger ? 'red' : 'white'} size={22} />
+			{Icon && <Icon color={isDanger ? 'red' : 'white'} size={22} />}
 		</Pressable>
 	);
 };
 
-const ActionDivider = () => <View style={tw`my-3.5 h-[0.5px] bg-app-line/80`} />;
+const ActionDivider = () => <View style={tw`my-3.5 h-[0.5px] bg-app-box`} />;
 
 export const ActionsModal = () => {
 	const fileInfoRef = useRef<ModalRef>(null);
+	const renameRef = useRef<ModalRef>(null);
 
 	const { modalRef, data } = useActionsModalStore();
+	const rspc = useRspcContext();
 
-	const filePath = data ? (isObject(data) ? data.item.file_paths[0] : data.item) : null;
-	const objectData = data ? (isObject(data) ? data.item : data.item.object) : null;
+	const objectData = data && getItemObject(data);
+	const filePath = data && getIndexedItemFilePath(data);
+
+	// Open
+	const updateAccessTime = useLibraryMutation('files.updateAccessTime', {
+		onSuccess: () => {
+			rspc.queryClient.invalidateQueries({ queryKey: ['search.paths'] });
+		}
+	});
+	const queriedFullPath = useLibraryQuery(['files.getPath', filePath?.id ?? -1], {
+		enabled: filePath != null
+	});
+
+	const deleteFile = useLibraryMutation('files.deleteFiles', {
+		onSuccess: () => {
+			rspc.queryClient.invalidateQueries({ queryKey: ['search.paths'] });
+			modalRef.current?.dismiss();
+		}
+	});
+
+	async function handleOpen() {
+		const absolutePath = queriedFullPath.data;
+		if (!absolutePath) return;
+		try {
+			await FileViewer.open(absolutePath, {
+				// Android only
+				showAppsSuggestions: false, // If there is not an installed app that can open the file, open the Play Store with suggested apps
+				showOpenWithDialog: true // if there is more than one app that can open the file, show an Open With dialogue box
+			});
+			if (filePath && filePath.object_id)
+				await updateAccessTime.mutateAsync([filePath.object_id]).catch(console.error);
+		} catch (error) {
+			toast.error('Error opening object');
+		}
+	}
 
 	return (
 		<>
 			<Modal ref={modalRef} snapPoints={['60', '90']}>
 				{data && (
 					<View style={tw`flex-1 px-4`}>
-						<View style={tw`flex flex-row items-center`}>
+						<View style={tw`flex flex-row`}>
 							{/* Thumbnail/Icon */}
-							<Pressable onPress={() => fileInfoRef.current?.present()}>
+							<Pressable
+								onPress={handleOpen}
+								onLongPress={() => fileInfoRef.current?.present()}
+							>
 								<FileThumb data={data} size={1} />
 							</Pressable>
 							<View style={tw`ml-2 flex-1`}>
 								{/* Name + Extension */}
 								<Text
-									style={tw`text-base font-bold text-gray-200`}
+									style={tw`max-w-[220px] text-base font-bold text-gray-200`}
 									numberOfLines={1}
 								>
 									{filePath?.name}
@@ -84,7 +133,7 @@ export const ActionsModal = () => {
 								</Text>
 								<View style={tw`flex flex-row`}>
 									<Text style={tw`text-xs text-ink-faint`}>
-										{formatBytes(Number(filePath?.size_in_bytes || 0))},
+										{`${humanizeSize(filePath?.size_in_bytes_bytes)}`},
 									</Text>
 									<Text style={tw`text-xs text-ink-faint`}>
 										{' '}
@@ -93,11 +142,15 @@ export const ActionsModal = () => {
 								</View>
 								<InfoTagPills data={data} />
 							</View>
-							{objectData && <FavoriteButton style={tw`mr-4`} data={objectData} />}
+							{objectData && (
+								<FavoriteButton style={tw`mr-1 mt-2`} data={objectData} />
+							)}
 						</View>
-						<View style={tw`my-3`} />
+						<View />
 						{/* Actions */}
 						<ActionsContainer>
+							<ActionsItem title="Open" onPress={handleOpen} />
+							<ActionDivider />
 							<ActionsItem
 								icon={Info}
 								title="Show Info"
@@ -105,7 +158,13 @@ export const ActionsModal = () => {
 							/>
 						</ActionsContainer>
 						<ActionsContainer style={tw`mt-2`}>
-							<ActionsItem icon={Pencil} title="Rename" />
+							<ActionsItem
+								onPress={() => {
+									renameRef.current?.present();
+								}}
+								icon={Pencil}
+								title="Rename"
+							/>
 							<ActionDivider />
 							<ActionsItem icon={Copy} title="Duplicate" />
 							<ActionDivider />
@@ -118,11 +177,24 @@ export const ActionsModal = () => {
 							<ActionDivider />
 							<ActionsItem icon={Package} title="Compress" />
 							<ActionDivider />
-							<ActionsItem icon={TrashSimple} title="Delete" isDanger />
+							<ActionsItem
+								icon={TrashSimple}
+								title="Delete"
+								isDanger
+								onPress={async () => {
+									if (filePath && filePath.location_id) {
+										await deleteFile.mutateAsync({
+											location_id: filePath.location_id,
+											file_path_ids: [filePath.id]
+										});
+									}
+								}}
+							/>
 						</ActionsContainer>
 					</View>
 				)}
 			</Modal>
+			<RenameModal ref={renameRef} />
 			<FileInfoModal ref={fileInfoRef} data={data} />
 		</>
 	);

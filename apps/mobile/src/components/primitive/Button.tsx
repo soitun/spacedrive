@@ -1,4 +1,4 @@
-import { VariantProps, cva } from 'class-variance-authority';
+import { cva, VariantProps } from 'class-variance-authority';
 import { MotiPressable, MotiPressableProps } from 'moti/interactions';
 import { FC, useMemo } from 'react';
 import { Pressable, PressableProps, View, ViewProps } from 'react-native';
@@ -7,11 +7,13 @@ import { twStyle } from '~/lib/tailwind';
 const button = cva(['items-center justify-center rounded-md border shadow-sm'], {
 	variants: {
 		variant: {
-			danger: ['border-red-800 bg-red-600'],
-			gray: ['border-app-line bg-app-button'],
-			darkGray: ['border-app-box bg-app'],
+			danger: ['border-red-800 bg-red-600 shadow-none'],
+			gray: ['border-app-box bg-app shadow-none'],
+			darkgray: ['border-app-box bg-app shadow-none'],
 			accent: ['border-accent-deep bg-accent shadow-md shadow-app-shade/10'],
-			outline: ['border-sidebar-line/60 ']
+			outline: ['border border-app-inputborder bg-transparent shadow-none'],
+			transparent: ['border-0 bg-transparent shadow-none'],
+			dashed: ['border border-dashed border-app-line bg-transparent shadow-none']
 		},
 		size: {
 			default: ['py-1.5', 'px-3'],
@@ -29,6 +31,7 @@ const button = cva(['items-center justify-center rounded-md border shadow-sm'], 
 });
 
 type ButtonProps = VariantProps<typeof button> & PressableProps;
+export type ButtonVariants = ButtonProps['variant'];
 
 export const Button: FC<ButtonProps> = ({ variant, size, disabled, ...props }) => {
 	const { style, ...otherProps } = props;
@@ -50,6 +53,7 @@ export const AnimatedButton: FC<AnimatedButtonProps> = ({ variant, size, disable
 	return (
 		<MotiPressable
 			disabled={disabled}
+			// @ts-ignore
 			animate={useMemo(
 				() =>
 					({ hovered, pressed }) => {

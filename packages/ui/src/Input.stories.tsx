@@ -1,8 +1,9 @@
 import { Meta } from '@storybook/react';
 import { useState } from 'react';
+
 import { Input } from './Input';
 
-export default {
+const meta: Meta<typeof Input> = {
 	title: 'Input',
 	component: Input,
 	argTypes: {},
@@ -14,7 +15,9 @@ export default {
 	args: {
 		children: 'Input'
 	}
-} as Meta<typeof Input>;
+};
+
+export default meta;
 
 export const Default = () => {
 	const [value, setValue] = useState('Spacedrive');

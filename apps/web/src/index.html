@@ -1,10 +1,14 @@
-<!DOCTYPE html>
+<!doctype html>
 <html class="vanilla-theme">
 	<head>
 		<meta charset="utf-8" />
 		<title>Spacedrive</title>
 		<link rel="manifest" href="/manifest.json" />
 		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<script>
+			// Some libs depend on webpack specific stuff
+			var global = globalThis || window;
+		</script>
 	</head>
 
 	<body style="overflow: hidden">

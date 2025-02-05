@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import { useCountUp } from 'use-count-up';
 import { proxy, useSnapshot } from 'valtio';
 
@@ -31,21 +31,49 @@ type UseCounterProps = {
 	 * default: `true`
 	 */
 	saveState?: boolean;
+	/**
+	 * Number of decimal places. Defaults to `1`.
+	 */
+	precision?: number;
+	/**
+	 * The locale to use for number formatting (e.g. `'de-DE'`).
+	 * Defaults to your system locale. Passed directed into [Intl.NumberFormat()](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/NumberFormat/NumberFormat).
+	 */
+	locales?: string | string[];
 };
 
-const useCounter = ({ name, start = 0, end, duration = 2, saveState = true }: UseCounterProps) => {
+export const useCounter = ({
+	name,
+	start = 0,
+	end,
+	locales,
+	duration = 2,
+	precision = 1,
+	saveState = true
+}: UseCounterProps) => {
 	const { lastValue, setLastValue } = useCounterState(name);
 
 	if (saveState && lastValue) {
 		start = lastValue;
 	}
 
+	const formatter = useMemo(
+		() =>
+			new Intl.NumberFormat(locales, {
+				style: 'decimal',
+				minimumFractionDigits: precision,
+				maximumFractionDigits: precision
+			}),
+		[locales, precision]
+	);
+
 	const { value } = useCountUp({
 		isCounting: !(start === end),
 		start,
 		end,
 		duration,
-		easing: 'easeOutCubic'
+		easing: 'easeOutCubic',
+		formatter: (value) => formatter.format(value)
 	});
 
 	useEffect(() => {
@@ -60,5 +88,3 @@ const useCounter = ({ name, start = 0, end, duration = 2, saveState = true }: Us
 
 	return value;
 };
-
-export default useCounter;

@@ -1,40 +1,29 @@
-import { Database } from '@sd/assets/icons';
+import * as Haptics from 'expo-haptics';
 import { Controller } from 'react-hook-form';
-import { Alert, Image, Text, View } from 'react-native';
-import { getOnboardingStore, useOnboardingStore } from '@sd/client';
-import { Input } from '~/components/form/Input';
+import { Text, View } from 'react-native';
+import { useOnboardingContext } from '~/components/context/OnboardingContext';
+import { Icon } from '~/components/icons/Icon';
 import { Button } from '~/components/primitive/Button';
-import { useZodForm, z } from '~/hooks/useZodForm';
+import { FeatureUnavailableAlert } from '~/components/primitive/FeatureUnavailableAlert';
+import { Input } from '~/components/primitive/Input';
 import { tw } from '~/lib/tailwind';
 import { OnboardingStackScreenProps } from '~/navigation/OnboardingNavigator';
+
 import { OnboardingContainer, OnboardingDescription, OnboardingTitle } from './GetStarted';
 
-const schema = z.object({
-	name: z.string().min(1, { message: 'Library name is required' })
-});
-
 const NewLibraryScreen = ({ navigation }: OnboardingStackScreenProps<'NewLibrary'>) => {
-	const obStore = useOnboardingStore();
+	const form = useOnboardingContext().forms.useForm('NewLibrary');
 
-	const form = useZodForm({
-		schema,
-		defaultValues: {
-			name: obStore.newLibraryName
-		}
-	});
-
-	const handleNewLibrary = form.handleSubmit(async (data) => {
-		getOnboardingStore().newLibraryName = data.name;
+	const handleNewLibrary = form.handleSubmit(() => {
+		Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 		navigation.navigate('Privacy');
 	});
 
-	const handleImport = () => {
-		Alert.alert('TODO');
-	};
+	const handleImport = () => FeatureUnavailableAlert();
 
 	return (
 		<OnboardingContainer>
-			<Image source={Database} style={tw`h-25 w-25`} />
+			<Icon name="Database" style={tw`h-25 w-25`} />
 			<OnboardingTitle style={tw`mt-4`}>Create a Library</OnboardingTitle>
 			<View style={tw`w-full px-4`}>
 				<OnboardingDescription style={tw`mt-4`}>
@@ -67,7 +56,7 @@ const NewLibraryScreen = ({ navigation }: OnboardingStackScreenProps<'NewLibrary
 					<Text style={tw`text-center font-medium text-ink`}>New Library</Text>
 				</Button>
 				<Text style={tw`px-4 text-xs font-bold text-ink-faint`}>OR</Text>
-				<Button onPress={handleImport} variant="outline">
+				<Button style={tw`opacity-50`} onPress={handleImport} variant="outline">
 					<Text style={tw`text-center font-medium text-ink`}>Import Library</Text>
 				</Button>
 			</View>

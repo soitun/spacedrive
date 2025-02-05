@@ -1,100 +1,115 @@
-use crate::util::error::FileIOError;
+use sd_core_file_path_helper::FilePathError;
 
-use std::path::PathBuf;
+use sd_prisma::prisma::location;
+use sd_utils::{
+	db::MissingFieldError,
+	error::{FileIOError, NonUtf8PathError},
+};
 
-use rspc::{self, ErrorCode};
+use std::path::Path;
+
+use rspc::ErrorCode;
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::{
-	file_path_helper::FilePathError, manager::LocationManagerError, metadata::LocationMetadataError,
-};
+use super::{manager::LocationManagerError, metadata::LocationMetadataError};
 
 /// Error type for location related errors
 #[derive(Error, Debug)]
 pub enum LocationError {
 	// Not Found errors
 	#[error("location not found <path='{}'>", .0.display())]
-	PathNotFound(PathBuf),
+	PathNotFound(Box<Path>),
 	#[error("location not found <uuid='{0}'>")]
 	UuidNotFound(Uuid),
 	#[error("location not found <id='{0}'>")]
-	IdNotFound(i32),
+	IdNotFound(location::id::Type),
 
 	// User errors
 	#[error("location not a directory <path='{}'>", .0.display())]
-	NotDirectory(PathBuf),
+	NotDirectory(Box<Path>),
 	#[error("could not find directory in location <path='{}'>", .0.display())]
-	DirectoryNotFound(PathBuf),
+	DirectoryNotFound(Box<Path>),
 	#[error(
 		"library exists in the location metadata file, must relink <old_path='{}', new_path='{}'>",
 		.old_path.display(),
 		.new_path.display(),
 	)]
 	NeedRelink {
-		old_path: PathBuf,
-		new_path: PathBuf,
+		old_path: Box<Path>,
+		new_path: Box<Path>,
 	},
 	#[error(
 		"this location belongs to another library, must update .spacedrive file <path='{}'>",
 		.0.display()
 	)]
-	AddLibraryToMetadata(PathBuf),
+	AddLibraryToMetadata(Box<Path>),
 	#[error("location metadata file not found <path='{}'>", .0.display())]
-	MetadataNotFound(PathBuf),
+	MetadataNotFound(Box<Path>),
 	#[error("location already exists in database <path='{}'>", .0.display())]
-	LocationAlreadyExists(PathBuf),
+	LocationAlreadyExists(Box<Path>),
 	#[error("nested location currently not supported <path='{}'>", .0.display())]
-	NestedLocation(PathBuf),
+	NestedLocation(Box<Path>),
+	#[error(transparent)]
+	NonUtf8Path(#[from] NonUtf8PathError),
 
 	// Internal Errors
 	#[error(transparent)]
-	LocationMetadataError(#[from] LocationMetadataError),
-	#[error("failed to read location path metadata info")]
+	LocationMetadata(#[from] LocationMetadataError),
+	#[error("failed to read location path metadata info: {0}")]
 	LocationPathFilesystemMetadataAccess(FileIOError),
 	#[error("missing metadata file for location <path='{}'>", .0.display())]
-	MissingMetadataFile(PathBuf),
-	#[error("failed to open file from local OS")]
-	FileReadError(FileIOError),
-	#[error("failed to read mounted volumes from local OS")]
+	MissingMetadataFile(Box<Path>),
+	#[error("failed to open file from local OS: {0}")]
+	FileRead(FileIOError),
+	#[error("failed to read mounted volumes from local OS: {0}")]
 	VolumeReadError(String),
-	#[error("database error")]
-	DatabaseError(#[from] prisma_client_rust::QueryError),
+	#[error("database error: {0}")]
+	Database(#[from] prisma_client_rust::QueryError),
 	#[error(transparent)]
-	LocationManagerError(#[from] LocationManagerError),
+	LocationManager(#[from] LocationManagerError),
 	#[error(transparent)]
-	FilePathError(#[from] FilePathError),
+	FilePath(#[from] FilePathError),
 	#[error(transparent)]
 	FileIO(#[from] FileIOError),
+	#[error("location missing path <id='{0}'>")]
+	MissingPath(location::id::Type),
+	#[error("missing-field: {0}")]
+	MissingField(#[from] MissingFieldError),
+	#[error("invalid location scan state value: {0}")]
+	InvalidScanStateValue(i32),
+	#[error(transparent)]
+	Sync(#[from] sd_core_sync::Error),
 }
 
 impl From<LocationError> for rspc::Error {
-	fn from(err: LocationError) -> Self {
-		match err {
+	fn from(e: LocationError) -> Self {
+		use LocationError::*;
+
+		match e {
 			// Not found errors
-			LocationError::PathNotFound(_)
-			| LocationError::UuidNotFound(_)
-			| LocationError::IdNotFound(_) => {
-				rspc::Error::with_cause(ErrorCode::NotFound, err.to_string(), err)
+			PathNotFound(_)
+			| UuidNotFound(_)
+			| IdNotFound(_)
+			| FilePath(FilePathError::IdNotFound(_) | FilePathError::NotFound(_)) => {
+				Self::with_cause(ErrorCode::NotFound, e.to_string(), e)
 			}
 
 			// User's fault errors
-			LocationError::NotDirectory(_)
-			| LocationError::NestedLocation(_)
-			| LocationError::LocationAlreadyExists(_) => {
-				rspc::Error::with_cause(ErrorCode::BadRequest, err.to_string(), err)
+			NotDirectory(_) | NestedLocation(_) | LocationAlreadyExists(_) => {
+				Self::with_cause(ErrorCode::BadRequest, e.to_string(), e)
 			}
 
-			// Custom error message is used to differenciate these errors in the frontend
+			// Custom error message is used to differentiate these errors in the frontend
 			// TODO: A better solution would be for rspc to support sending custom data alongside errors
-			LocationError::NeedRelink { .. } => {
-				rspc::Error::with_cause(ErrorCode::Conflict, "NEED_RELINK".to_owned(), err)
-			}
-			LocationError::AddLibraryToMetadata(_) => {
-				rspc::Error::with_cause(ErrorCode::Conflict, "ADD_LIBRARY".to_owned(), err)
+			NeedRelink { .. } => Self::with_cause(ErrorCode::Conflict, "NEED_RELINK".to_owned(), e),
+			AddLibraryToMetadata(_) => {
+				Self::with_cause(ErrorCode::Conflict, "ADD_LIBRARY".to_owned(), e)
 			}
 
-			_ => rspc::Error::with_cause(ErrorCode::InternalServerError, err.to_string(), err),
+			// Internal errors
+			MissingField(missing_error) => missing_error.into(),
+			_ => Self::with_cause(ErrorCode::InternalServerError, e.to_string(), e),
 		}
 	}
 }

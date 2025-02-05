@@ -1,76 +1,135 @@
 import { DrawerNavigationHelpers } from '@react-navigation/drawer/lib/typescript/src/types';
 import { useNavigation } from '@react-navigation/native';
+import { keepPreviousData } from '@tanstack/react-query';
 import { useRef } from 'react';
 import { Pressable, Text, View } from 'react-native';
-import { useLibraryQuery } from '@sd/client';
+import {
+	arraysEqual,
+	humanizeSize,
+	Location,
+	useLibraryQuery,
+	useOnlineLocations
+} from '@sd/client';
 import { ModalRef } from '~/components/layout/Modal';
 import { tw, twStyle } from '~/lib/tailwind';
+
 import FolderIcon from '../icons/FolderIcon';
 import CollapsibleView from '../layout/CollapsibleView';
 import ImportModal from '../modal/ImportModal';
+import { Button } from '../primitive/Button';
 
 type DrawerLocationItemProps = {
-	folderName: string;
 	onPress: () => void;
+	location: Location;
 };
 
-const DrawerLocationItem: React.FC<DrawerLocationItemProps> = (props) => {
-	const { folderName, onPress } = props;
+const DrawerLocationItem: React.FC<DrawerLocationItemProps> = ({
+	location,
+	onPress
+}: DrawerLocationItemProps) => {
+	const onlineLocations = useOnlineLocations();
+	const online = onlineLocations.some((l) => arraysEqual(location.pub_id, l));
 
 	return (
 		<Pressable onPress={onPress}>
-			<View style={twStyle('mb-[4px] flex flex-row items-center rounded px-1 py-2')}>
-				<FolderIcon size={20} />
-				<Text style={twStyle('ml-1.5 font-medium text-gray-300')} numberOfLines={1}>
-					{folderName}
-				</Text>
+			<View
+				style={twStyle(
+					'h-auto w-full flex-row items-center justify-between rounded-md border border-app-inputborder/50 bg-app-darkBox p-2'
+				)}
+			>
+				<View style={tw`w-full flex-row items-center justify-between gap-1.5`}>
+					<View style={tw`flex-1 flex-row items-center gap-1`}>
+						<View style={tw`relative`}>
+							<FolderIcon size={20} />
+							<View
+								style={twStyle(
+									'z-5 absolute bottom-[3px] right-px h-1.5 w-1.5 rounded-full',
+									online ? 'bg-green-500' : 'bg-red-500'
+								)}
+							/>
+						</View>
+						<Text
+							style={tw`flex-1 text-xs font-medium text-ink`}
+							ellipsizeMode="tail"
+							numberOfLines={1}
+						>
+							{location.name ?? ''}
+						</Text>
+					</View>
+					<View
+						style={tw`items-center rounded-md border border-app-box/70 bg-app/70 px-1 py-0.5`}
+					>
+						<Text style={tw`text-[11px] font-bold text-ink-dull`} numberOfLines={1}>
+							{`${humanizeSize(location.size_in_bytes)}`}
+						</Text>
+					</View>
+				</View>
 			</View>
 		</Pressable>
 	);
 };
 
-type DrawerLocationsProp = {
-	stackName: string;
-};
-
-const DrawerLocations = ({ stackName }: DrawerLocationsProp) => {
+const DrawerLocations = () => {
 	const navigation = useNavigation<DrawerNavigationHelpers>();
 
-	const importModalRef = useRef<ModalRef>(null);
+	const modalRef = useRef<ModalRef>(null);
 
-	const { data: locations } = useLibraryQuery(['locations.list'], { keepPreviousData: true });
+	const result = useLibraryQuery(['locations.list'], { placeholderData: keepPreviousData });
+	const locations = result.data || [];
 
 	return (
 		<>
 			<CollapsibleView
 				title="Locations"
-				titleStyle={tw`text-sm font-semibold text-gray-300`}
-				containerStyle={tw`mb-3 ml-1 mt-6`}
+				titleStyle={tw`text-sm font-semibold text-ink`}
+				containerStyle={tw`mb-3 mt-6`}
 			>
-				<View style={tw`mt-2`}>
-					{locations?.map((location) => (
+				<View style={tw`mt-2 flex-col justify-between gap-1`}>
+					{locations?.slice(0, 3).map((location) => (
 						<DrawerLocationItem
 							key={location.id}
-							folderName={location.name}
+							location={location}
 							onPress={() =>
-								navigation.navigate(stackName, {
+								navigation.navigate('BrowseStack', {
 									screen: 'Location',
-									params: { id: location.id }
+									params: { id: location.id },
+									initial: false
 								})
 							}
 						/>
 					))}
 				</View>
-				{/* Add Location */}
-				<Pressable onPress={() => importModalRef.current?.present()}>
-					<View style={tw`mt-1 rounded border border-dashed border-app-line/80`}>
-						<Text style={tw`p-2 text-center text-xs font-bold text-gray-400`}>
-							Add Location
+				<View style={tw`mt-2 flex-row flex-wrap gap-1`}>
+					{/* Add Location */}
+					<Button
+						style={twStyle(`py-0`, locations?.length > 3 ? 'w-[49%]' : 'w-full')}
+						onPress={() => modalRef.current?.present()}
+						variant="dashed"
+					>
+						<Text style={tw`p-2 text-center text-xs font-medium text-ink-dull`}>
+							+ Location
 						</Text>
-					</View>
-				</Pressable>
+					</Button>
+					{/* See all locations */}
+					{locations?.length > 3 && (
+						<Button
+							onPress={() => {
+								navigation.navigate('BrowseStack', {
+									screen: 'Locations',
+									initial: false
+								});
+							}}
+							style={tw`w-[49%] py-0`}
+							variant="gray"
+						>
+							<Text style={tw`p-2 text-center text-xs font-medium text-ink`}>
+								View all
+							</Text>
+						</Button>
+					)}
+				</View>
 			</CollapsibleView>
-			<ImportModal ref={importModalRef} />
+			<ImportModal ref={modalRef} />
 		</>
 	);
 };

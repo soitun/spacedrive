@@ -4,7 +4,9 @@ import { valtioPersist } from '@sd/client';
 export const dismissibleNoticeStore = valtioPersist('dismissible-notice', {
 	mediaView: false,
 	gridView: false,
-	listView: false
+	listView: false,
+	ephemeral: false,
+	ephemeralMoveFiles: false
 });
 
 export function useDismissibleNoticeStore() {

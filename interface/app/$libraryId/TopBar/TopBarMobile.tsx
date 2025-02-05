@@ -1,8 +1,9 @@
-import { DotsThreeCircle } from 'phosphor-react';
-import React, { HTMLAttributes, forwardRef } from 'react';
-import { Popover } from '@sd/ui';
-import { TOP_BAR_ICON_STYLE, ToolOption } from '.';
+import { DotsThreeCircle } from '@phosphor-icons/react';
+import React, { forwardRef, HTMLAttributes } from 'react';
+import { Popover, usePopover } from '@sd/ui';
+
 import TopBarButton, { TopBarButtonProps } from './TopBarButton';
+import { ToolOption, TOP_BAR_ICON_DEFAULT_PROPS } from './TopBarOptions';
 
 const GroupTool = forwardRef<
 	HTMLButtonElement,
@@ -17,7 +18,7 @@ const GroupTool = forwardRef<
 			checkIcon
 			{...props}
 		>
-			{tool.icon}
+			{typeof tool.icon === 'function' ? tool.icon({ triggerOpen: () => {} }) : tool.icon}
 			{tool.toolTipLabel}
 		</TopBarButton>
 	);
@@ -28,6 +29,7 @@ interface Props extends HTMLAttributes<HTMLDivElement> {
 }
 
 export default ({ toolOptions, className }: Props) => {
+	const popover = usePopover();
 	const toolsNotSmFlex = toolOptions?.map((group) =>
 		group.filter((tool) => tool.showAtResolution !== 'sm:flex')
 	);
@@ -35,9 +37,10 @@ export default ({ toolOptions, className }: Props) => {
 	return (
 		<div className={className}>
 			<Popover
+				popover={popover}
 				trigger={
 					<TopBarButton>
-						<DotsThreeCircle className={TOP_BAR_ICON_STYLE} />
+						<DotsThreeCircle {...TOP_BAR_ICON_DEFAULT_PROPS} />
 					</TopBarButton>
 				}
 			>
@@ -48,11 +51,10 @@ export default ({ toolOptions, className }: Props) => {
 								{group.map((tool) => (
 									<React.Fragment key={tool.toolTipLabel}>
 										{tool.popOverComponent ? (
-											<Popover trigger={<GroupTool tool={tool} />}>
-												<div className="min-w-[250px]">
-													{tool.popOverComponent}
-												</div>
-											</Popover>
+											<ToolPopover
+												tool={tool}
+												triggerClose={() => popover.setOpen(false)}
+											/>
 										) : (
 											<GroupTool tool={tool} />
 										)}
@@ -70,3 +72,15 @@ export default ({ toolOptions, className }: Props) => {
 		</div>
 	);
 };
+
+function ToolPopover({ tool, triggerClose }: { tool: ToolOption; triggerClose: () => void }) {
+	return (
+		<Popover popover={usePopover()} trigger={<GroupTool tool={tool} />}>
+			<div className="min-w-[250px]">
+				{typeof tool.popOverComponent === 'function'
+					? tool.popOverComponent({ triggerClose })
+					: tool.popOverComponent}
+			</div>
+		</Popover>
+	);
+}

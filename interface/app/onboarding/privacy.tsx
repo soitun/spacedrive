@@ -1,67 +1,52 @@
-import { useNavigate } from 'react-router';
-import { getOnboardingStore } from '@sd/client';
-import { Button } from '@sd/ui';
-import { Form, RadioGroup, useZodForm, z } from '@sd/ui/src/forms';
-import { OnboardingContainer, OnboardingDescription, OnboardingTitle } from './Layout';
-import { useUnlockOnboardingScreen } from './Progress';
+import { Info, Question } from '@phosphor-icons/react';
+import { Button, Form, RadioGroupField } from '@sd/ui';
+import { useLocale } from '~/hooks';
+import { usePlatform } from '~/util/Platform';
 
-export const shareTelemetry = RadioGroup.options([
-	z.literal('share-telemetry'),
-	z.literal('no-telemetry')
-]).details({
-	'share-telemetry': {
-		heading: 'Share anonymous usage',
-		description:
-			'Share completely anonymous telemetry data to help the developers improve the app'
-	},
-	'no-telemetry': {
-		heading: 'Share nothing',
-		description: 'Do not share any telemetry data with the developers'
-	}
-});
-
-const schema = z.object({
-	shareTelemetry: shareTelemetry.schema
-});
+import { OnboardingContainer, OnboardingDescription, OnboardingTitle } from './components';
+import { shareTelemetry, useOnboardingContext } from './context';
 
 export default function OnboardingPrivacy() {
-	const navigate = useNavigate();
+	const { t } = useLocale();
+	const { forms, submit } = useOnboardingContext();
+	const platform = usePlatform();
 
-	useUnlockOnboardingScreen();
-
-	const form = useZodForm({
-		schema,
-		defaultValues: {
-			shareTelemetry: 'share-telemetry'
-		}
-	});
-
-	const onSubmit = form.handleSubmit(async (data) => {
-		getOnboardingStore().shareTelemetry = data.shareTelemetry === 'share-telemetry';
-
-		navigate('/onboarding/creating-library', { replace: true });
-	});
+	const form = forms.useForm('privacy');
 
 	return (
-		<Form form={form} onSubmit={onSubmit} className="flex flex-col items-center">
+		<Form
+			form={form}
+			onSubmit={form.handleSubmit(submit)}
+			className="flex flex-col items-center"
+		>
 			<OnboardingContainer>
-				<OnboardingTitle>Your Privacy</OnboardingTitle>
-				<OnboardingDescription>
-					Spacedrive is built for privacy, that's why we're open source and local first.
-					So we'll make it very clear what data is shared with us.
-				</OnboardingDescription>
-				<div className="m-4">
-					<RadioGroup.Root {...form.register('shareTelemetry')}>
+				<OnboardingTitle>{t('your_privacy')}</OnboardingTitle>
+				<OnboardingDescription>{t('privacy_description')}</OnboardingDescription>
+				<div className="m-6">
+					<RadioGroupField.Root {...form.register('shareTelemetry')}>
 						{shareTelemetry.options.map(({ value, heading, description }) => (
-							<RadioGroup.Item key={value} value={value}>
+							<RadioGroupField.Item key={value} value={value}>
 								<h1 className="font-bold">{heading}</h1>
 								<p className="text-sm text-ink-faint">{description}</p>
-							</RadioGroup.Item>
+							</RadioGroupField.Item>
 						))}
-					</RadioGroup.Root>
+					</RadioGroupField.Root>
+					<Button
+						size="sm"
+						className="mx-auto mt-5 flex items-center justify-center gap-1 text-center"
+						variant="gray"
+						onClick={() => {
+							platform.openLink(
+								'https://www.spacedrive.com/docs/product/resources/privacy'
+							);
+						}}
+					>
+						<Info size={13} />
+						{t('more_info')}
+					</Button>
 				</div>
-				<Button className="text-center" type="submit" variant="accent" size="sm">
-					Continue
+				<Button type="submit" className="mt-5 text-center" variant="accent" size="sm">
+					{t('continue')}
 				</Button>
 			</OnboardingContainer>
 		</Form>
