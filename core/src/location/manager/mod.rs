@@ -1,4 +1,12 @@
-use crate::{job::JobManagerError, library::Library, util::error::FileIOError};
+use crate::{
+	library::{Library, LibraryManagerEvent},
+	Node,
+};
+
+use sd_core_file_path_helper::FilePathError;
+
+use sd_prisma::prisma::location;
+use sd_utils::{db::MissingFieldError, error::FileIOError};
 
 use std::{
 	collections::BTreeSet,
@@ -6,219 +14,278 @@ use std::{
 	sync::Arc,
 };
 
+use async_channel as chan;
 use futures::executor::block_on;
 use thiserror::Error;
-use tokio::sync::{
-	broadcast::{self, Receiver},
-	oneshot, RwLock,
+use tokio::{
+	spawn,
+	sync::{
+		broadcast::{self, Receiver},
+		oneshot, RwLock,
+	},
 };
-use tracing::{debug, error};
-
-#[cfg(feature = "location-watcher")]
-use tokio::sync::mpsc;
+use tracing::{debug, error, instrument, trace};
 use uuid::Uuid;
 
-use super::{file_path_helper::FilePathError, LocationId};
-
-#[cfg(feature = "location-watcher")]
+mod runner;
 mod watcher;
 
-#[cfg(feature = "location-watcher")]
-mod helpers;
-
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 enum ManagementMessageAction {
 	Add,
 	Remove,
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct LocationManagementMessage {
-	location_id: LocationId,
-	library: Library,
+	location_id: location::id::Type,
+	library: Arc<Library>,
 	action: ManagementMessageAction,
-	response_tx: oneshot::Sender<Result<(), LocationManagerError>>,
+	ack: oneshot::Sender<Result<(), LocationManagerError>>,
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 enum WatcherManagementMessageAction {
-	Stop,
-	Reinit,
+	Pause,
+	Resume,
 	IgnoreEventsForPath { path: PathBuf, ignore: bool },
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct WatcherManagementMessage {
-	location_id: LocationId,
-	library: Library,
+	location_id: location::id::Type,
+	library: Arc<Library>,
 	action: WatcherManagementMessageAction,
-	response_tx: oneshot::Sender<Result<(), LocationManagerError>>,
+	ack: oneshot::Sender<Result<(), LocationManagerError>>,
 }
 
 #[derive(Error, Debug)]
 pub enum LocationManagerError {
-	#[cfg(feature = "location-watcher")]
-	#[error("Unable to send location management message to location manager actor: (error: {0})")]
-	ActorSendLocationError(#[from] mpsc::error::SendError<LocationManagementMessage>),
+	#[error("location not found in database: <id={0}>")]
+	LocationNotFound(location::id::Type),
 
-	#[cfg(feature = "location-watcher")]
-	#[error("Unable to send path to be ignored by watcher actor: (error: {0})")]
-	ActorIgnorePathError(#[from] mpsc::error::SendError<watcher::IgnorePath>),
+	#[error("watcher error: {0}")]
+	Watcher(#[from] notify::Error),
 
-	#[cfg(feature = "location-watcher")]
-	#[error("Unable to watcher management message to watcher manager actor: (error: {0})")]
-	ActorIgnorePathMessageError(#[from] mpsc::error::SendError<WatcherManagementMessage>),
+	#[error("non local location: <id='{0}'>")]
+	NonLocalLocation(location::id::Type),
 
-	#[error("Unable to receive actor response: (error: {0})")]
-	ActorResponseError(#[from] oneshot::error::RecvError),
-
-	#[cfg(feature = "location-watcher")]
-	#[error("Watcher error: (error: {0})")]
-	WatcherError(#[from] notify::Error),
-
-	#[error("Failed to stop or reinit a watcher: {reason}")]
-	FailedToStopOrReinitWatcher { reason: String },
-
-	#[error("Missing location from database: <id='{0}'>")]
-	MissingLocation(LocationId),
-
-	#[error("Non local location: <id='{0}'>")]
-	NonLocalLocation(LocationId),
+	#[error("file still exists on disk after remove event received: <path='{}'>", .0.display())]
+	FileStillExistsOnDisk(Box<Path>),
 
 	#[error("failed to move file '{}' for reason: {reason}", .path.display())]
-	MoveError { path: Box<Path>, reason: String },
+	MoveError {
+		path: Box<Path>,
+		reason: &'static str,
+	},
 
-	#[error("Tried to update a non-existing file: <path='{0}'>")]
-	UpdateNonExistingFile(PathBuf),
-	#[error("Database error: {0}")]
-	DatabaseError(#[from] prisma_client_rust::QueryError),
-	#[error("File path related error (error: {0})")]
-	FilePathError(#[from] FilePathError),
-	#[error("Corrupted location pub_id on database: (error: {0})")]
+	#[error("database error: {0}")]
+	Database(#[from] prisma_client_rust::QueryError),
+	#[error("corrupted location pub_id on database: {0}")]
 	CorruptedLocationPubId(#[from] uuid::Error),
-	#[error("Job Manager error: (error: {0})")]
-	JobManager(#[from] JobManagerError),
+	#[error("missing field: {0}")]
+	MissingField(#[from] MissingFieldError),
 
 	#[error(transparent)]
+	FilePath(#[from] FilePathError),
+	#[error(transparent)]
+	IndexerRuler(#[from] sd_core_indexer_rules::Error),
+	#[error(transparent)]
+	JobSystem(#[from] sd_core_heavy_lifting::Error),
+	#[error(transparent)]
 	FileIO(#[from] FileIOError),
+	#[error(transparent)]
+	Sync(#[from] sd_core_sync::Error),
 }
 
 type OnlineLocations = BTreeSet<Vec<u8>>;
 
-#[derive(Debug)]
-pub struct LocationManager {
-	online_locations: RwLock<OnlineLocations>,
-	pub online_tx: broadcast::Sender<OnlineLocations>,
-	#[cfg(feature = "location-watcher")]
-	location_management_tx: mpsc::Sender<LocationManagementMessage>,
-	#[cfg(feature = "location-watcher")]
-	watcher_management_tx: mpsc::Sender<WatcherManagementMessage>,
-	stop_tx: Option<oneshot::Sender<()>>,
+#[must_use = "'LocationManagerActor::start' must be used to start the actor"]
+pub struct LocationManagerActor {
+	location_management_rx: chan::Receiver<LocationManagementMessage>,
+	watcher_management_rx: chan::Receiver<WatcherManagementMessage>,
+	stop_rx: chan::Receiver<()>,
 }
 
-impl LocationManager {
-	pub fn new() -> Arc<Self> {
-		let online_tx = broadcast::channel(16).0;
+impl LocationManagerActor {
+	pub fn start(self, node: Arc<Node>) {
+		spawn({
+			let node = node.clone();
+			let rx = node.libraries.rx.clone();
+			async move {
+				if let Err(e) = rx
+					.subscribe(|event| {
+						let node = node.clone();
+						async move {
+							match event {
+								LibraryManagerEvent::Load(library) => {
+									for location in library
+										.db
+										.location()
+										.find_many(vec![])
+										.exec()
+										.await
+										.unwrap_or_else(|e| {
+											error!(
+												?e,
+												"Failed to get locations from database for location manager;",
+											);
 
-		debug!("LocationManager initialized");
+											vec![]
+										}) {
+										if let Err(e) =
+											node.locations.add(location.id, library.clone()).await
+										{
+											error!(
+												?e,
+												"Failed to add location to location manager;",
+											);
+										}
+									}
+								}
+								LibraryManagerEvent::Edit(_) => {}
+								LibraryManagerEvent::InstancesModified(_) => {}
+								LibraryManagerEvent::Delete(_) => {
+									#[cfg(debug_assertions)]
+									error!("TODO: Remove locations from location manager"); // TODO
+								}
+							}
+						}
+					})
+					.await
+				{
+					error!(
+						?e,
+						"Core may become unstable! LocationManager's \
+						library manager subscription aborted with error;",
+					);
+				}
+			}
+		});
 
-		#[cfg(feature = "location-watcher")]
-		{
-			let (location_management_tx, location_management_rx) = mpsc::channel(128);
-			let (watcher_management_tx, watcher_management_rx) = mpsc::channel(128);
-			let (stop_tx, stop_rx) = oneshot::channel();
-
-			#[cfg(feature = "location-watcher")]
-			tokio::spawn(Self::run_locations_checker(
+		spawn({
+			let node = Arc::clone(&node);
+			let Self {
 				location_management_rx,
 				watcher_management_rx,
 				stop_rx,
-			));
+			} = self;
 
-			Arc::new(Self {
+			async move {
+				while let Err(e) = spawn({
+					runner::run(
+						location_management_rx.clone(),
+						watcher_management_rx.clone(),
+						stop_rx.clone(),
+						Arc::clone(&node),
+					)
+				})
+				.await
+				{
+					if e.is_panic() {
+						error!(?e, "Location manager panicked;");
+					} else {
+						trace!("Location manager received shutdown signal and will exit...");
+						break;
+					}
+					trace!("Restarting location manager processing task...");
+				}
+
+				debug!("Location manager gracefully shutdown");
+			}
+		});
+	}
+}
+
+pub struct Locations {
+	online_locations: RwLock<OnlineLocations>,
+	pub online_tx: broadcast::Sender<OnlineLocations>,
+
+	location_management_tx: chan::Sender<LocationManagementMessage>,
+
+	watcher_management_tx: chan::Sender<WatcherManagementMessage>,
+	stop_tx: chan::Sender<()>,
+}
+
+impl Locations {
+	pub fn new() -> (Self, LocationManagerActor) {
+		let (location_management_tx, location_management_rx) = chan::bounded(128);
+		let (watcher_management_tx, watcher_management_rx) = chan::bounded(128);
+		let (stop_tx, stop_rx) = chan::bounded(1);
+
+		debug!("Starting location manager actor");
+
+		(
+			Self {
 				online_locations: Default::default(),
-				online_tx,
+				online_tx: broadcast::channel(16).0,
 				location_management_tx,
 				watcher_management_tx,
-				stop_tx: Some(stop_tx),
-			})
-		}
-
-		#[cfg(not(feature = "location-watcher"))]
-		{
-			tracing::warn!("Location watcher is disabled, locations will not be checked");
-			Arc::new(Self {
-				online_tx,
-				online_locations: Default::default(),
-				stop_tx: None,
-			})
-		}
+				stop_tx,
+			},
+			LocationManagerActor {
+				location_management_rx,
+				watcher_management_rx,
+				stop_rx,
+			},
+		)
 	}
 
+	#[instrument(skip(self, library), fields(library_id = %library.id), err)]
 	#[inline]
-	#[allow(unused_variables)]
 	async fn location_management_message(
 		&self,
-		location_id: LocationId,
-		library: Library,
+		location_id: location::id::Type,
+		library: Arc<Library>,
 		action: ManagementMessageAction,
 	) -> Result<(), LocationManagerError> {
-		#[cfg(feature = "location-watcher")]
-		{
-			let (tx, rx) = oneshot::channel();
+		let (tx, rx) = oneshot::channel();
+		trace!("Sending location management message to location manager actor");
 
-			self.location_management_tx
-				.send(LocationManagementMessage {
-					location_id,
-					library,
-					action,
-					response_tx: tx,
-				})
-				.await?;
+		self.location_management_tx
+			.send(LocationManagementMessage {
+				location_id,
+				library,
+				action,
+				ack: tx,
+			})
+			.await
+			.expect("Location manager actor channel closed sending new location message");
 
-			rx.await?
-		}
-
-		#[cfg(not(feature = "location-watcher"))]
-		Ok(())
+		rx.await
+			.expect("Ack channel closed for location management message response")
 	}
 
+	#[instrument(skip(self, library), fields(library_id = %library.id), err)]
 	#[inline]
 	#[allow(unused_variables)]
 	async fn watcher_management_message(
 		&self,
-		location_id: LocationId,
-		library: Library,
+		location_id: location::id::Type,
+		library: Arc<Library>,
 		action: WatcherManagementMessageAction,
 	) -> Result<(), LocationManagerError> {
-		#[cfg(feature = "location-watcher")]
-		{
-			let (tx, rx) = oneshot::channel();
+		let (tx, rx) = oneshot::channel();
+		trace!("Sending watcher management message to location manager actor");
 
-			self.watcher_management_tx
-				.send(WatcherManagementMessage {
-					location_id,
-					library,
-					action,
-					response_tx: tx,
-				})
-				.await?;
+		self.watcher_management_tx
+			.send(WatcherManagementMessage {
+				location_id,
+				library,
+				action,
+				ack: tx,
+			})
+			.await
+			.expect("Location manager actor channel closed sending new watcher message");
 
-			rx.await?
-		}
-
-		#[cfg(not(feature = "location-watcher"))]
-		Ok(())
+		rx.await
+			.expect("Ack channel closed for watcher management message response")
 	}
 
 	pub async fn add(
 		&self,
-		location_id: LocationId,
-		library: Library,
+		location_id: location::id::Type,
+		library: Arc<Library>,
 	) -> Result<(), LocationManagerError> {
 		self.location_management_message(location_id, library, ManagementMessageAction::Add)
 			.await
@@ -226,43 +293,43 @@ impl LocationManager {
 
 	pub async fn remove(
 		&self,
-		location_id: LocationId,
-		library: Library,
+		location_id: location::id::Type,
+		library: Arc<Library>,
 	) -> Result<(), LocationManagerError> {
 		self.location_management_message(location_id, library, ManagementMessageAction::Remove)
 			.await
 	}
 
-	pub async fn stop_watcher(
+	pub async fn pause_watcher(
 		&self,
-		location_id: LocationId,
-		library: Library,
+		location_id: location::id::Type,
+		library: Arc<Library>,
 	) -> Result<(), LocationManagerError> {
-		self.watcher_management_message(location_id, library, WatcherManagementMessageAction::Stop)
+		self.watcher_management_message(location_id, library, WatcherManagementMessageAction::Pause)
 			.await
 	}
 
-	pub async fn reinit_watcher(
+	pub async fn resume_watcher(
 		&self,
-		location_id: LocationId,
-		library: Library,
+		location_id: location::id::Type,
+		library: Arc<Library>,
 	) -> Result<(), LocationManagerError> {
 		self.watcher_management_message(
 			location_id,
 			library,
-			WatcherManagementMessageAction::Reinit,
+			WatcherManagementMessageAction::Resume,
 		)
 		.await
 	}
 
-	pub async fn temporary_stop(
+	pub async fn temporary_watcher_pause(
 		&self,
-		location_id: LocationId,
-		library: Library,
-	) -> Result<StopWatcherGuard, LocationManagerError> {
-		self.stop_watcher(location_id, library.clone()).await?;
+		location_id: location::id::Type,
+		library: Arc<Library>,
+	) -> Result<PauseWatcherGuard<'_>, LocationManagerError> {
+		self.pause_watcher(location_id, library.clone()).await?;
 
-		Ok(StopWatcherGuard {
+		Ok(PauseWatcherGuard {
 			location_id,
 			library: Some(library),
 			manager: self,
@@ -271,10 +338,10 @@ impl LocationManager {
 
 	pub async fn temporary_ignore_events_for_path(
 		&self,
-		location_id: LocationId,
-		library: Library,
-		path: impl AsRef<Path>,
-	) -> Result<IgnoreEventsForPathGuard, LocationManagerError> {
+		location_id: location::id::Type,
+		library: Arc<Library>,
+		path: impl AsRef<Path> + Send,
+	) -> Result<IgnoreEventsForPathGuard<'_>, LocationManagerError> {
 		let path = path.as_ref().to_path_buf();
 
 		self.watcher_management_message(
@@ -295,212 +362,6 @@ impl LocationManager {
 		})
 	}
 
-	#[cfg(feature = "location-watcher")]
-	async fn run_locations_checker(
-		mut location_management_rx: mpsc::Receiver<LocationManagementMessage>,
-		mut watcher_management_rx: mpsc::Receiver<WatcherManagementMessage>,
-		mut stop_rx: oneshot::Receiver<()>,
-	) -> Result<(), LocationManagerError> {
-		use std::collections::{HashMap, HashSet};
-
-		use futures::stream::{FuturesUnordered, StreamExt};
-		use tokio::select;
-		use tracing::{info, warn};
-
-		use helpers::{
-			check_online, drop_location, get_location, handle_ignore_path_request,
-			handle_reinit_watcher_request, handle_remove_location_request,
-			handle_stop_watcher_request, location_check_sleep, unwatch_location, watch_location,
-		};
-		use watcher::LocationWatcher;
-
-		let mut to_check_futures = FuturesUnordered::new();
-		let mut to_remove = HashSet::new();
-		let mut locations_watched = HashMap::new();
-		let mut locations_unwatched = HashMap::new();
-		let mut forced_unwatch = HashSet::new();
-
-		loop {
-			select! {
-				// Location management messages
-				Some(LocationManagementMessage{
-					location_id,
-					library,
-					action,
-					response_tx
-				}) = location_management_rx.recv() => {
-					match action {
-
-						// To add a new location
-						ManagementMessageAction::Add => {
-							if let Some(location) = get_location(location_id, &library).await {
-								let is_online = match check_online(&location, &library).await {
-									Ok(is_online) => is_online,
-									Err(e) => {
-										error!("Error while checking online status of location {location_id}: {e}");
-										continue;
-									}
-								};
-								let _ = response_tx.send(
-									LocationWatcher::new(location, library.clone())
-										.await
-										.map(|mut watcher| {
-											if is_online {
-												watcher.watch();
-												locations_watched.insert(
-													(location_id, library.id),
-													watcher
-												);
-											} else {
-												locations_unwatched.insert(
-													(location_id, library.id),
-													watcher
-												);
-											}
-
-											to_check_futures.push(
-												location_check_sleep(location_id, library)
-											);
-										}
-									)
-								); // ignore errors, we handle errors on receiver
-							} else {
-								warn!(
-									"Location not found in database to be watched: {}",
-									location_id
-								);
-							}
-						},
-
-						// To remove an location
-						ManagementMessageAction::Remove => {
-							handle_remove_location_request(
-								location_id,
-								library,
-								response_tx,
-								&mut forced_unwatch,
-								&mut locations_watched,
-								&mut locations_unwatched,
-								&mut to_remove,
-							).await;
-						},
-					}
-				}
-
-				// Watcher management messages
-				Some(WatcherManagementMessage{
-					location_id,
-					library,
-					action,
-					response_tx,
-				}) = watcher_management_rx.recv() => {
-					match action {
-						// To stop a watcher
-						WatcherManagementMessageAction::Stop => {
-							handle_stop_watcher_request(
-								location_id,
-								library,
-								response_tx,
-								&mut forced_unwatch,
-								&mut locations_watched,
-								&mut locations_unwatched,
-							).await;
-						},
-
-						// To reinit a stopped watcher
-						WatcherManagementMessageAction::Reinit => {
-							handle_reinit_watcher_request(
-								location_id,
-								library,
-								response_tx,
-								&mut forced_unwatch,
-								&mut locations_watched,
-								&mut locations_unwatched,
-							).await;
-						},
-
-						// To ignore or not events for a path
-						WatcherManagementMessageAction::IgnoreEventsForPath { path, ignore } => {
-							handle_ignore_path_request(
-								location_id,
-								library,
-								path,
-								ignore,
-								response_tx,
-								&locations_watched,
-							);
-						},
-					}
-				}
-
-				// Periodically checking locations
-				Some((location_id, library)) = to_check_futures.next() => {
-					let key = (location_id, library.id);
-
-					if to_remove.contains(&key) {
-						// The time to check came for an already removed library, so we just ignore it
-						to_remove.remove(&key);
-					} else if let Some(location) = get_location(location_id, &library).await {
-						if location.node_id == library.node_local_id {
-							let is_online = match check_online(&location, &library).await {
-								Ok(is_online) => is_online,
-								Err(e) => {
-									error!("Error while checking online status of location {location_id}: {e}");
-									continue;
-								}
-							};
-
-							if is_online
-								&& !forced_unwatch.contains(&key)
-							{
-								watch_location(
-									location,
-									library.id,
-									&mut locations_watched,
-									&mut locations_unwatched,
-								);
-							} else {
-								unwatch_location(
-									location,
-									library.id,
-									&mut locations_watched,
-									&mut locations_unwatched,
-								);
-							}
-							to_check_futures.push(location_check_sleep(location_id, library));
-						} else {
-							drop_location(
-								location_id,
-								library.id,
-								"Dropping location from location manager, because \
-								it isn't a location in the current node",
-								&mut locations_watched,
-								&mut locations_unwatched
-							);
-							forced_unwatch.remove(&key);
-						}
-					} else {
-						drop_location(
-							location_id,
-							library.id,
-							"Removing location from manager, as we failed to fetch from db",
-							&mut locations_watched,
-							&mut locations_unwatched,
-						);
-						forced_unwatch.remove(&key);
-					}
-				}
-
-				_ = &mut stop_rx => {
-					info!("Stopping location manager");
-					break;
-				}
-			}
-		}
-
-		Ok(())
-	}
-
 	pub async fn is_online(&self, id: &Uuid) -> bool {
 		let online_locations = self.online_locations.read().await;
 		online_locations.iter().any(|v| v == id.as_bytes())
@@ -515,16 +376,20 @@ impl LocationManager {
 	}
 
 	pub async fn add_online(&self, id: Uuid) {
-		self.online_locations
-			.write()
-			.await
-			.insert(id.as_bytes().to_vec());
+		{
+			self.online_locations
+				.write()
+				.await
+				.insert(id.as_bytes().to_vec());
+		}
 		self.broadcast_online().await;
 	}
 
 	pub async fn remove_online(&self, id: &Uuid) {
-		let mut online_locations = self.online_locations.write().await;
-		online_locations.retain(|v| v != id.as_bytes());
+		{
+			let mut online_locations = self.online_locations.write().await;
+			online_locations.retain(|v| v != id.as_bytes());
+		}
 		self.broadcast_online().await;
 	}
 
@@ -533,59 +398,54 @@ impl LocationManager {
 	}
 }
 
-impl Drop for LocationManager {
+impl Drop for Locations {
 	fn drop(&mut self) {
-		if let Some(stop_tx) = self.stop_tx.take() {
-			if stop_tx.send(()).is_err() {
-				error!("Failed to send stop signal to location manager");
-			}
+		// SAFETY: This will never block as we only have 1 sender and this channel has 1 slot
+		if self.stop_tx.send_blocking(()).is_err() {
+			error!("Failed to send stop signal to location manager");
 		}
 	}
 }
 
 #[must_use = "this `StopWatcherGuard` must be held for some time, so the watcher is stopped"]
-pub struct StopWatcherGuard<'m> {
-	manager: &'m LocationManager,
-	location_id: LocationId,
-	library: Option<Library>,
+pub struct PauseWatcherGuard<'m> {
+	manager: &'m Locations,
+	location_id: location::id::Type,
+	library: Option<Arc<Library>>,
 }
 
-impl Drop for StopWatcherGuard<'_> {
+impl Drop for PauseWatcherGuard<'_> {
 	fn drop(&mut self) {
-		if cfg!(feature = "location-watcher") {
-			// FIXME: change this Drop to async drop in the future
-			if let Err(e) = block_on(
-				self.manager
-					.reinit_watcher(self.location_id, self.library.take().unwrap()),
-			) {
-				error!("Failed to reinit watcher on stop watcher guard drop: {e}");
-			}
+		// FIXME: change this Drop to async drop in the future
+		if let Err(e) = block_on(self.manager.resume_watcher(
+			self.location_id,
+			self.library.take().expect("library should be set"),
+		)) {
+			error!(?e, "Failed to resume watcher on stop watcher guard drop;");
 		}
 	}
 }
 
 #[must_use = "this `IgnoreEventsForPathGuard` must be held for some time, so the watcher can ignore events for the desired path"]
 pub struct IgnoreEventsForPathGuard<'m> {
-	manager: &'m LocationManager,
+	manager: &'m Locations,
 	path: Option<PathBuf>,
-	location_id: LocationId,
-	library: Option<Library>,
+	location_id: location::id::Type,
+	library: Option<Arc<Library>>,
 }
 
 impl Drop for IgnoreEventsForPathGuard<'_> {
 	fn drop(&mut self) {
-		if cfg!(feature = "location-watcher") {
-			// FIXME: change this Drop to async drop in the future
-			if let Err(e) = block_on(self.manager.watcher_management_message(
-				self.location_id,
-				self.library.take().unwrap(),
-				WatcherManagementMessageAction::IgnoreEventsForPath {
-					path: self.path.take().unwrap(),
-					ignore: false,
-				},
-			)) {
-				error!("Failed to un-ignore path on watcher guard drop: {e}");
-			}
+		// FIXME: change this Drop to async drop in the future
+		if let Err(e) = block_on(self.manager.watcher_management_message(
+			self.location_id,
+			self.library.take().expect("library should be set"),
+			WatcherManagementMessageAction::IgnoreEventsForPath {
+				path: self.path.take().expect("path should be set"),
+				ignore: false,
+			},
+		)) {
+			error!(?e, "Failed to un-ignore path on watcher guard drop;");
 		}
 	}
 }

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rspc::{
 	alpha::{
 		unstable::{MwArgMapper, MwArgMapperMiddleware},
@@ -20,7 +22,10 @@ pub(crate) struct LibraryArgs<T> {
 
 pub(crate) struct LibraryArgsLike;
 impl MwArgMapper for LibraryArgsLike {
-	type Input<T> = LibraryArgs<T> where T: Type + DeserializeOwned + 'static;
+	type Input<T>
+		= LibraryArgs<T>
+	where
+		T: Type + DeserializeOwned + 'static;
 	type State = Uuid;
 
 	fn map<T: Serialize + DeserializeOwned + Type + 'static>(
@@ -30,11 +35,11 @@ impl MwArgMapper for LibraryArgsLike {
 	}
 }
 
-pub(crate) fn library() -> impl MwV3<Ctx, NewCtx = (Ctx, Library)> {
+pub(crate) fn library() -> impl MwV3<Ctx, NewCtx = (Ctx, Arc<Library>)> {
 	MwArgMapperMiddleware::<LibraryArgsLike>::new().mount(|mw, ctx: Ctx, library_id| async move {
 		let library = ctx
-			.library_manager
-			.get_library(library_id)
+			.libraries
+			.get_library(&library_id)
 			.await
 			.ok_or_else(|| {
 				rspc::Error::new(

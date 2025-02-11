@@ -1,6 +1,7 @@
 import {
 	BottomSheetBackdrop,
 	BottomSheetBackdropProps,
+	BottomSheetFlatList,
 	BottomSheetHandle,
 	BottomSheetHandleProps,
 	BottomSheetModal,
@@ -8,10 +9,11 @@ import {
 	BottomSheetScrollView
 } from '@gorhom/bottom-sheet';
 import { X } from 'phosphor-react-native';
-import { ReactNode, forwardRef } from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { forwardRef, ReactNode } from 'react';
+import { Platform, Pressable, Text, View } from 'react-native';
 import useForwardedRef from '~/hooks/useForwardedRef';
-import { tw } from '~/lib/tailwind';
+import { tw, twStyle } from '~/lib/tailwind';
+
 import { Button } from '../primitive/Button';
 
 const ModalBackdrop = (props: BottomSheetBackdropProps) => (
@@ -26,8 +28,8 @@ interface ModalHandle extends BottomSheetHandleProps {
 const ModalHandle = (props: ModalHandle) => (
 	<BottomSheetHandle
 		{...props}
-		style={tw`items-end rounded-t-2xl bg-app`}
-		indicatorStyle={tw`bg-app-highlight/60`}
+		style={tw`items-end rounded-t-2xl bg-app-modal`}
+		indicatorStyle={tw`bg-app-lightborder`}
 	>
 		{props.showCloseButton && (
 			<Pressable
@@ -45,29 +47,40 @@ export type ModalRef = BottomSheetModal;
 interface ModalProps extends BottomSheetModalProps {
 	children: React.ReactNode;
 	title?: string;
+	description?: string;
 	showCloseButton?: boolean;
 }
 
 export const Modal = forwardRef<ModalRef, ModalProps>((props, ref) => {
-	const { children, title, showCloseButton = false, ...otherProps } = props;
+	const { children, title, description, showCloseButton = false, ...otherProps } = props;
 
 	const modalRef = useForwardedRef(ref);
 
 	return (
 		<BottomSheetModal
 			ref={modalRef}
-			backgroundStyle={tw`bg-app`}
+			backgroundStyle={tw`bg-app-modal`}
 			backdropComponent={ModalBackdrop}
 			handleComponent={(props) => ModalHandle({ modalRef, showCloseButton, ...props })}
+			// Overriding the default value for iOS to fix Maestro issue.
+			// https://github.com/app-dev-inc/maestro/issues/1493
+			accessible={Platform.select({
+				// setting it to false on Android seems to cause issues with TalkBack instead
+				ios: false
+			})}
 			{...otherProps}
 		>
 			{title && <Text style={tw`text-center text-base font-medium text-ink`}>{title}</Text>}
+			{props.description && (
+				<Text style={tw`px-4 py-3 text-sm text-ink-dull`}>{props.description}</Text>
+			)}
 			{children}
 		</BottomSheetModal>
 	);
 });
 
 export const ModalScrollView = BottomSheetScrollView;
+export const ModalFlatlist = BottomSheetFlatList;
 
 type ConfirmModalProps = {
 	title: string;
@@ -91,6 +104,7 @@ type ConfirmModalProps = {
 	 * You can also use ref to open the modal
 	 */
 	trigger?: ReactNode;
+	triggerStyle?: string;
 };
 
 // TODO: Add loading state
@@ -101,11 +115,16 @@ export const ConfirmModal = forwardRef<ModalRef, ConfirmModalProps>((props, ref)
 	return (
 		<>
 			{props.trigger && (
-				<Pressable onPress={() => modalRef.current?.present()}>{props.trigger}</Pressable>
+				<Pressable
+					style={twStyle(props.triggerStyle)}
+					onPress={() => modalRef.current?.present()}
+				>
+					{props.trigger}
+				</Pressable>
 			)}
 			<BottomSheetModal
 				ref={modalRef}
-				backgroundStyle={tw`bg-app`}
+				backgroundStyle={tw`bg-app-modal`}
 				backdropComponent={ModalBackdrop}
 				handleComponent={(props) =>
 					ModalHandle({ modalRef, showCloseButton: false, ...props })

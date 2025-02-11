@@ -1,9 +1,12 @@
-import * as DialogPrimitive from '@radix-ui/react-dialog';
+'use client';
+
+import * as RDialog from '@radix-ui/react-dialog';
 import { animated, useTransition } from '@react-spring/web';
 import clsx from 'clsx';
 import { ReactElement, ReactNode, useEffect } from 'react';
-import { FieldValues } from 'react-hook-form';
+import { FieldValues, UseFormHandleSubmit } from 'react-hook-form';
 import { proxy, ref, subscribe, useSnapshot } from 'valtio';
+
 import { Button, Loader } from '../';
 import { Form, FormProps } from './forms/Form';
 
@@ -50,14 +53,16 @@ class DialogManager {
 		return this.state[id];
 	}
 
+	isAnyDialogOpen() {
+		return Object.values(this.state).some((s) => s.open);
+	}
+
 	remove(id: number) {
 		const state = this.getState(id);
 
 		if (!state) {
-			throw new Error(`Dialog ${id} not registered!`);
-		}
-
-		if (state.open === false) {
+			console.error(new Error(`Dialog ${id} not registered!`));
+		} else if (state.open === false) {
 			delete this.dialogs[id];
 			delete this.state[id];
 		}
@@ -103,31 +108,49 @@ export function Dialogs() {
 	);
 }
 
+const AnimatedDialogContent = animated(RDialog.Content);
+const AnimatedDialogOverlay = animated(RDialog.Overlay);
+
 export interface DialogProps<S extends FieldValues>
-	extends DialogPrimitive.DialogProps,
-		FormProps<S> {
+	extends RDialog.DialogProps,
+		Omit<FormProps<S>, 'onSubmit'> {
+	title?: string;
 	dialog: ReturnType<typeof useDialog>;
+	loading?: boolean;
 	trigger?: ReactNode;
 	ctaLabel?: string;
-	closeLabel?: string;
-	ctaDanger?: boolean;
-	title?: string;
-	description?: string;
+	ctaSecondLabel?: string;
+	onSubmit?: ReturnType<UseFormHandleSubmit<S>>;
+	onSubmitSecond?: ReturnType<UseFormHandleSubmit<S>>;
 	children?: ReactNode;
-	transformOrigin?: string;
-	loading?: boolean;
+	ctaDanger?: boolean;
+	cancelDanger?: boolean;
+	closeLabel?: string;
+	cancelLabel?: string;
+	cancelBtn?: boolean;
+	description?: ReactNode;
+	onCancelled?: boolean | (() => void);
 	submitDisabled?: boolean;
-	onCancelled?: () => void;
+	transformOrigin?: string;
+	buttonsSideContent?: ReactNode;
+	invertButtonFocus?: boolean; //this reverses the focus order of submit/cancel buttons
+	errorMessageException?: string; //this is to bypass a specific form error message if it starts with a specific string
+	formClassName?: string;
+	icon?: ReactNode;
+	hideButtons?: boolean;
+	ignoreClickOutside?: boolean;
 }
 
 export function Dialog<S extends FieldValues>({
 	form,
-	onSubmit,
 	dialog,
+	onSubmit,
+	onSubmitSecond,
+	onCancelled = true,
+	invertButtonFocus,
 	...props
 }: DialogProps<S>) {
 	const stateSnap = useSnapshot(dialog.state);
-
 	const transitions = useTransition(stateSnap.open, {
 		from: {
 			opacity: 0,
@@ -141,80 +164,182 @@ export function Dialog<S extends FieldValues>({
 
 	const setOpen = (v: boolean) => (dialog.state.open = v);
 
-	return (
-		<DialogPrimitive.Root open={stateSnap.open} onOpenChange={setOpen}>
-			{props.trigger && (
-				<DialogPrimitive.Trigger asChild>{props.trigger}</DialogPrimitive.Trigger>
+	const cancelButton = (
+		<RDialog.Close asChild>
+			<Button
+				size="sm"
+				variant={props.cancelDanger ? 'colored' : 'gray'}
+				onClick={typeof onCancelled === 'function' ? onCancelled : undefined}
+				className={clsx(props.cancelDanger && 'border-red-500 bg-red-500')}
+			>
+				{props.cancelLabel || 'Cancel'}
+			</Button>
+		</RDialog.Close>
+	);
+
+	const closeButton = (
+		<RDialog.Close asChild>
+			<Button
+				disabled={props.loading}
+				size="sm"
+				variant={'gray'}
+				onClick={typeof onCancelled === 'function' ? onCancelled : undefined}
+			>
+				{props.closeLabel || 'Close'}
+			</Button>
+		</RDialog.Close>
+	);
+	const disableCheck = props.errorMessageException
+		? !form.formState.isValid &&
+			!form.formState.errors.root?.serverError?.message?.startsWith(
+				props.errorMessageException as string
+			)
+		: !form.formState.isValid;
+
+	const submitButton = !props.ctaSecondLabel ? (
+		<Button
+			type="submit"
+			size="sm"
+			disabled={form.formState.isSubmitting || props.submitDisabled || disableCheck}
+			variant={props.ctaDanger ? 'colored' : 'accent'}
+			className={clsx(
+				props.ctaDanger &&
+					'border-red-500 bg-red-500 focus:ring-1 focus:ring-red-500 focus:ring-offset-2 focus:ring-offset-app-selected'
 			)}
+			onClick={async (e: React.MouseEvent<HTMLElement>) => {
+				e.preventDefault();
+				await onSubmit?.(e);
+				dialog.onSubmit?.();
+				setOpen(false);
+			}}
+		>
+			{props.ctaLabel}
+		</Button>
+	) : (
+		<div className="flex flex-row gap-x-2">
+			<Button
+				type="submit"
+				size="sm"
+				disabled={form.formState.isSubmitting || props.submitDisabled || disableCheck}
+				variant={props.ctaDanger ? 'colored' : 'accent'}
+				className={clsx(
+					props.ctaDanger &&
+						'border-red-500 bg-red-500 focus:ring-1 focus:ring-red-500 focus:ring-offset-2 focus:ring-offset-app-selected'
+				)}
+				onClick={async (e: React.MouseEvent<HTMLElement>) => {
+					e.preventDefault();
+					await onSubmit?.(e);
+					dialog.onSubmit?.();
+					setOpen(false);
+				}}
+			>
+				{props.ctaLabel}
+			</Button>
+			<Button
+				type="submit"
+				size="sm"
+				disabled={form.formState.isSubmitting || props.submitDisabled || disableCheck}
+				variant={props.ctaDanger ? 'colored' : 'accent'}
+				className={clsx(
+					props.ctaDanger &&
+						'border-primary-500 bg-primary-500 focus:ring-1 focus:ring-primary-500 focus:ring-offset-2 focus:ring-offset-app-selected'
+				)}
+				onClick={async (e: React.MouseEvent<HTMLElement>) => {
+					e.preventDefault();
+					await onSubmitSecond?.(e);
+					dialog.onSubmit?.();
+					setOpen(false);
+				}}
+			>
+				{props.ctaSecondLabel}
+			</Button>
+		</div>
+	);
+
+	return (
+		<RDialog.Root open={stateSnap.open} onOpenChange={setOpen}>
+			{props.trigger && <RDialog.Trigger asChild>{props.trigger}</RDialog.Trigger>}
 			{transitions((styles, show) =>
 				show ? (
-					<DialogPrimitive.Portal forceMount>
-						<DialogPrimitive.Overlay asChild forceMount>
-							<animated.div
-								className="z-49 fixed inset-0 m-[1px] grid place-items-center overflow-y-auto rounded-xl bg-app/50"
-								style={{
-									opacity: styles.opacity
-								}}
-							/>
-						</DialogPrimitive.Overlay>
+					<RDialog.Portal forceMount>
+						<AnimatedDialogOverlay
+							className="fixed inset-0 z-[102] m-px grid place-items-center overflow-y-auto rounded-xl bg-app/50"
+							style={{
+								opacity: styles.opacity
+							}}
+						/>
 
-						<DialogPrimitive.Content asChild forceMount>
-							<animated.div
-								className="!pointer-events-none fixed inset-0 z-50 grid place-items-center overflow-y-auto"
-								style={styles}
+						<AnimatedDialogContent
+							className="!pointer-events-none fixed inset-0 z-[103] grid place-items-center overflow-y-auto"
+							style={styles}
+							onInteractOutside={(e) =>
+								props.ignoreClickOutside && e.preventDefault()
+							}
+						>
+							<Form
+								form={form}
+								onSubmit={async (e) => {
+									e?.preventDefault();
+									setOpen(false);
+								}}
+								className={clsx(
+									'!pointer-events-auto my-8 min-w-[300px] max-w-[400px] rounded-md',
+									'border border-app-line bg-app-box text-ink shadow-app-shade',
+									props.formClassName
+								)}
 							>
-								<Form
-									form={form}
-									onSubmit={async (e) => {
-										await onSubmit?.(e);
-										dialog.onSubmit?.();
-										setOpen(false);
-									}}
-									className="!pointer-events-auto my-8 min-w-[300px] max-w-[400px] rounded-md border border-app-line bg-app-box text-ink shadow-app-shade"
-								>
-									<div className="p-5">
-										<DialogPrimitive.Title className="mb-2 font-bold">
-											{props.title}
-										</DialogPrimitive.Title>
-										<DialogPrimitive.Description className="text-sm text-ink-dull">
+								<RDialog.Title className="flex items-center gap-2.5 border-b border-app-line bg-app-input/60 p-3 font-bold">
+									{props.icon && props.icon}
+									{props.title}
+								</RDialog.Title>
+								<div className="p-5">
+									{props.description && (
+										<RDialog.Description className="mb-2 text-sm text-ink-dull">
 											{props.description}
-										</DialogPrimitive.Description>
-										{props.children}
-									</div>
-									<div className="flex flex-row justify-end space-x-2 border-t border-app-line bg-app-selected p-3">
-										{form.formState.isSubmitting && <Loader />}
-										<div className="grow" />
-										<DialogPrimitive.Close asChild>
-											<Button
-												disabled={props.loading}
-												size="sm"
-												variant="gray"
-												onClick={props.onCancelled}
-											>
-												{props.closeLabel || 'Close'}
-											</Button>
-										</DialogPrimitive.Close>
-										<Button
-											type="submit"
-											size="sm"
-											disabled={
-												form.formState.isSubmitting || props.submitDisabled
-											}
-											variant={props.ctaDanger ? 'colored' : 'accent'}
+										</RDialog.Description>
+									)}
+
+									{props.children}
+								</div>
+								<div
+									className={clsx(
+										'flex items-center justify-end space-x-2 border-t border-app-line bg-app-input/60 p-3'
+									)}
+								>
+									{form.formState.isSubmitting && <Loader />}
+									{props.buttonsSideContent && (
+										<div>{props.buttonsSideContent}</div>
+									)}
+									<div className="grow" />
+									{!props.hideButtons && (
+										<div
 											className={clsx(
-												props.ctaDanger && 'border-red-500 bg-red-500'
+												invertButtonFocus ? 'flex-row-reverse' : 'flex-row',
+												'flex gap-2'
 											)}
 										>
-											{props.ctaLabel}
-										</Button>
-									</div>
-								</Form>
-								<Remover id={dialog.id} />
-							</animated.div>
-						</DialogPrimitive.Content>
-					</DialogPrimitive.Portal>
+											{invertButtonFocus ? (
+												<>
+													{submitButton}
+													{props.cancelBtn && cancelButton}
+													{onCancelled && closeButton}
+												</>
+											) : (
+												<>
+													{onCancelled && closeButton}
+													{props.cancelBtn && cancelButton}
+													{submitButton}
+												</>
+											)}
+										</div>
+									)}
+								</div>
+							</Form>
+							<Remover id={dialog.id} />
+						</AnimatedDialogContent>
+					</RDialog.Portal>
 				) : null
 			)}
-		</DialogPrimitive.Root>
+		</RDialog.Root>
 	);
 }

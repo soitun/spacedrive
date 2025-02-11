@@ -1,28 +1,51 @@
 [package]
-name = "sd-p2p"
-version = "0.1.0"
-description = "Rust Peer to Peer Networking Library"
-authors = ["Oscar Beaumont <oscar@otbeaumont.me>"]
-edition = "2021"
+name    = "sd-p2p"
+version = "0.2.0"
+
+authors              = ["Oscar Beaumont <oscar@otbeaumont.me>"]
+description          = "Rust Peer to Peer Networking Library"
+edition.workspace    = true
+license.workspace    = true
+readme               = "README.md"
+repository.workspace = true
+
+# TODO: Remove features??? and dependencies
 
 [features]
 default = []
-serde = []
-specta = []
+specta  = []
 
 [dependencies]
-tokio = { workspace = true, features = ["macros", "sync", "time", "io-util"] }
-libp2p = { version = "0.51.0", features = ["tokio", "quic", "serde"] }
-mdns-sd = "0.6.1"
-thiserror = "1.0.39"
-tracing = "0.1.37"
-serde = { version = "1.0.152", features = ["derive"] }
-rmp-serde = "1.1.1"
-specta = { workspace = true }
-flume = "0.10.14"
-tokio-util = { version = "0.7.7", features = ["compat"] }
-arc-swap = "1.6.0"
+# Workspace dependencies
+base64        = { workspace = true }
+ed25519-dalek = { workspace = true }
+flume         = { workspace = true }
+futures       = { workspace = true }
+rmp-serde     = { workspace = true }
+serde         = { workspace = true, features = ["derive"] }
+specta        = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true, features = ["fs", "io-util", "macros", "sync", "time"] }
+tokio-util    = { workspace = true, features = ["compat"] }
+tracing       = { workspace = true }
+uuid          = { workspace = true, features = ["serde"] }
+zeroize       = { workspace = true, features = ["derive"] }
+
+# Specific P2P dependencies
+dns-lookup    = "2.0"
+hash_map_diff = "0.2.0"
+if-watch      = { version = "=3.2.0", features = ["tokio"] } # Override features used by libp2p-quic
+libp2p-stream = "=0.2.0-alpha"                               # Update blocked due to custom patch
+mdns-sd       = "0.11.5"
+rand_core     = "0.6.4"
+stable-vec    = "0.4.1"
+sync_wrapper  = "1.0"
+
+[dependencies.libp2p]
+features = ["autonat", "dcutr", "macros", "noise", "quic", "relay", "serde", "tokio", "yamux"]
+version  = "=0.54.1"                                                                           # Update blocked due to custom patch
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread"] }
-tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
+tokio              = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
+uuid               = { workspace = true, features = ["v4"] }

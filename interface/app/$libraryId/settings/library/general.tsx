@@ -1,84 +1,146 @@
-import { useForm } from 'react-hook-form';
-import { useBridgeMutation, useLibraryContext } from '@sd/client';
-import { Button, Input, dialogManager } from '@sd/ui';
-import { useDebouncedFormWatch } from '~/hooks/useDebouncedForm';
+import {
+	MaybeUndefined,
+	useBridgeMutation,
+	useLibraryContext,
+	useLibraryMutation,
+	useZodForm
+} from '@sd/client';
+import { Button, dialogManager, Form, InputField, Switch, Tooltip, z } from '@sd/ui';
+import { useDebouncedFormWatch, useLocale } from '~/hooks';
+
 import { Heading } from '../Layout';
-import Setting from '../Setting';
 import DeleteLibraryDialog from '../node/libraries/DeleteDialog';
+import Setting from '../Setting';
+
+const schema = z.object({
+	id: z.string(),
+	name: z.string().min(1),
+	description: z.string().nullable()
+});
+
+// TODO: With some extra upstream Specta work this should be able to be removed
+function toMaybeUndefined<T>(v: T | null | undefined): MaybeUndefined<T> {
+	return v as any;
+}
 
 export const Component = () => {
 	const { library } = useLibraryContext();
 	const editLibrary = useBridgeMutation('library.edit');
+	const vacuumLibrary = useLibraryMutation('library.vacuumDb');
 
-	const form = useForm({
-		defaultValues: { id: library!.uuid, ...library?.config }
+	const { t } = useLocale();
+
+	const form = useZodForm({
+		schema,
+		defaultValues: {
+			id: library!.uuid,
+			...library?.config
+		},
+		mode: 'onChange'
 	});
+	const { isValid } = form.formState;
 
-	useDebouncedFormWatch(form, (value) =>
+	useDebouncedFormWatch(form, (value) => {
+		if (!isValid) return;
 		editLibrary.mutate({
 			id: library.uuid,
 			name: value.name ?? null,
-			description: value.description ?? null
-		})
-	);
+			description: toMaybeUndefined(value.description)
+		});
+	});
 
 	return (
-		<>
-			<Heading
-				title="Library Settings"
-				description="General settings related to the currently active library."
-			/>
-			<div className="flex flex-row space-x-5 pb-3">
-				<div className="flex grow flex-col">
-					<span className="mb-1 text-sm font-medium">Name</span>
-					<Input
+		<Form form={form}>
+			<div className="flex w-full max-w-4xl flex-col space-y-6 pb-5">
+				<Heading
+					title={t('library_settings')}
+					description={t('library_settings_description')}
+				/>
+
+				<input type="hidden" {...form.register('id')} />
+
+				<div className="flex flex-row space-x-5 pb-3">
+					<InputField
 						size="md"
-						{...form.register('name', { required: true })}
+						label={t('name')}
+						formFieldClassName="flex-1"
 						defaultValue="My Default Library"
+						{...form.register('name', { required: true })}
+					/>
+					<InputField
+						label={t('description')}
+						size="md"
+						formFieldClassName="flex-1"
+						{...form.register('description')}
 					/>
 				</div>
-				<div className="flex grow flex-col">
-					<span className="mb-1 text-sm font-medium">Description</span>
-					<Input size="md" {...form.register('description')} placeholder="" />
-				</div>
-			</div>
 
-			{/* <Setting
-				mini
-				title="Encrypt Library"
-				description="Enable encryption for this library, this will only encrypt the Spacedrive database, not the files themselves."
-			>
-				<div className="ml-3 flex items-center">
-					<Switch checked={false} />
-				</div>
-			</Setting> */}
-			{/* <Setting mini title="Export Library" description="Export this library to a file.">
-				<div className="mt-2">
-					<Button size="sm" variant="gray">
-						Export
-					</Button>
-				</div>
-			</Setting> */}
-			<Setting
-				mini
-				title="Delete Library"
-				description="This is permanent, your files will not be deleted, only the Spacedrive library."
-			>
-				<div className="mt-2">
-					<Button
-						size="sm"
-						variant="colored"
-						className="border-red-500 bg-red-500"
-						onClick={() => {
-							dialogManager.create((dp) => (
-								<DeleteLibraryDialog {...dp} libraryUuid={library.uuid} />
-							));
-						}}
-					>
-						Delete
-					</Button>
-				</div>
-			</Setting>
-		</>
+				<Setting
+					mini
+					title={t('encrypt_library')}
+					description={t('encrypt_library_description')}
+				>
+					<div className="ml-3 flex items-center">
+						<Tooltip label={t('encrypt_library_coming_soon')}>
+							<Switch disabled size="md" checked={false} />
+						</Tooltip>
+					</div>
+				</Setting>
+
+				<Setting
+					mini
+					title={t('export_library')}
+					description={t('export_library_description')}
+				>
+					<div className="mt-2">
+						<Tooltip label={t('export_library_coming_soon')}>
+							<Button disabled size="sm" variant="gray" className="whitespace-nowrap">
+								{t('export')}
+							</Button>
+						</Tooltip>
+					</div>
+				</Setting>
+
+				<Setting
+					mini
+					title={t('vacuum_library')}
+					description={t('vacuum_library_description')}
+				>
+					<div className="mt-2">
+						<Button
+							onClick={() => vacuumLibrary.mutate(null)}
+							disabled={vacuumLibrary.isPending}
+							size="sm"
+							variant="gray"
+							className="whitespace-nowrap"
+						>
+							{t('vacuum')}
+						</Button>
+					</div>
+				</Setting>
+
+				<Setting
+					mini
+					title={t('delete_library')}
+					description={t('delete_library_description')}
+				>
+					<div className="mt-2">
+						<Button
+							size="sm"
+							variant="colored"
+							className="whitespace-nowrap border-red-500 bg-red-500"
+							onClick={() => {
+								dialogManager.create((dp) => (
+									<DeleteLibraryDialog {...dp} libraryUuid={library.uuid} />
+								));
+							}}
+						>
+							{t('delete')}
+						</Button>
+					</div>
+				</Setting>
+				<div className="block h-20" />
+			</div>
+		</Form>
 	);
 };

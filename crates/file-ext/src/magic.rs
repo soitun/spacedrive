@@ -54,7 +54,7 @@ macro_rules! extension_enum {
 		}
 	) => {
 		// construct enum
-		#[derive(Debug, ::serde::Serialize, ::serde::Deserialize, PartialEq, Eq)]
+		#[derive(Debug, ::serde::Serialize, ::serde::Deserialize, PartialEq, Eq, Clone)]
 		pub enum Extension {
 			$( $variant($type), )*
 		}
@@ -107,7 +107,7 @@ macro_rules! extension_category_enum {
 			$($(#[$variant_attr:meta])* $variant:ident $(= $( [$($magic_bytes:tt),*] $(+ $offset:literal)? )|+ )? ,)*
 		}
 	) => {
-		#[derive(Debug, ::serde::Serialize, ::serde::Deserialize, ::strum::Display, Clone, Copy, PartialEq, Eq)]
+		#[derive(Debug, ::serde::Serialize, ::serde::Deserialize, ::strum::Display, ::specta::Type, Clone, Copy, PartialEq, Eq)]
 		#[serde(rename_all = "snake_case")]
 		#[strum(serialize_all = "snake_case")]
 		$(#[$enum_attr])*
@@ -127,7 +127,7 @@ macro_rules! extension_category_enum {
 		impl std::str::FromStr for $enum_name {
 			type Err = serde_json::Error;
 			fn from_str(s: &str) -> Result<Self, Self::Err> {
-				serde_json::from_value(serde_json::Value::String(s.to_string()))
+				serde_json::from_value(serde_json::Value::String(s.to_lowercase()))
 			}
 		}
 	};
@@ -176,18 +176,14 @@ impl Extension {
 	pub async fn resolve_conflicting(
 		path: impl AsRef<Path>,
 		always_check_magic_bytes: bool,
-	) -> Option<Extension> {
-		let Some(ext_str) = path.as_ref().extension().and_then(OsStr::to_str) else {
-            return None
-        };
+	) -> Option<Self> {
+		let ext_str = path.as_ref().extension().and_then(OsStr::to_str)?;
 
-		let Some(ext) = Extension::from_str(ext_str) else {
-			return None
-		};
+		let ext = Self::from_str(ext_str)?;
 
 		let Ok(ref mut file) = File::open(&path).await else {
-            return None
-        };
+			return None;
+		};
 
 		match ext {
 			// we don't need to check the magic bytes unless there is conflict
@@ -215,15 +211,19 @@ impl Extension {
 				}
 			}
 			ExtensionPossibility::Conflicts(ext) => match ext_str {
-				"ts" => {
-					let maybe_video_ext = if ext.iter().any(|e| matches!(e, Extension::Video(_))) {
-						verify_magic_bytes(VideoExtension::Ts, file)
-							.await
-							.map(Extension::Video)
-					} else {
-						None
-					};
-					Some(maybe_video_ext.unwrap_or(Extension::Code(CodeExtension::Ts)))
+				"ts" if ext.iter().any(|e| matches!(e, Self::Video(_))) => {
+					verify_magic_bytes(VideoExtension::Ts, file)
+						.await
+						.map_or(Some(Self::Code(CodeExtension::Ts)), |video_ext| {
+							Some(Self::Video(video_ext))
+						})
+				}
+				"mts" if ext.iter().any(|e| matches!(e, Self::Video(_))) => {
+					verify_magic_bytes(VideoExtension::Mts, file)
+						.await
+						.map_or(Some(Self::Code(CodeExtension::Mts)), |video_ext| {
+							Some(Self::Video(video_ext))
+						})
 				}
 				_ => None,
 			},

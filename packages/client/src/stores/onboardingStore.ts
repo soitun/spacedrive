@@ -1,7 +1,6 @@
-import { useSnapshot } from 'valtio';
-import { Algorithm } from '../core';
-import { HashingAlgoSlug } from '../utils';
-import { valtioPersist } from './util';
+import { createMutable } from 'solid-js/store';
+
+import { createPersistedMutable, useSolidStore } from '../solid';
 
 export enum UseCase {
 	CameraRoll = 'cameraRoll',
@@ -11,37 +10,33 @@ export enum UseCase {
 	Other = 'other'
 }
 
-const onboardingStoreDefaults = {
-	newLibraryName: '',
-	unlockedScreens: ['start'],
+const onboardingStoreDefaults = () => ({
+	unlockedScreens: ['prerelease'],
 	lastActiveScreen: null as string | null,
-	shareTelemetry: true,
 	useCases: [] as UseCase[],
-	grantedFullDiskAccess: false
-};
+	grantedFullDiskAccess: false,
+	data: {} as Record<string, any> | undefined,
+	showIntro: true
+});
 
-const appOnboardingStore = valtioPersist('onboarding', onboardingStoreDefaults);
+export const onboardingStore = createPersistedMutable(
+	'onboarding',
+	createMutable(onboardingStoreDefaults())
+);
 
 export function useOnboardingStore() {
-	return useSnapshot(appOnboardingStore);
-}
-
-export function getOnboardingStore() {
-	return appOnboardingStore;
+	return useSolidStore(onboardingStore);
 }
 
 export function resetOnboardingStore() {
-	for (const key in onboardingStoreDefaults) {
-		// @ts-expect-error - TODO: type needs to be fixed
-		appOnboardingStore[key] = onboardingStoreDefaults[key];
-	}
+	Object.assign(onboardingStore, onboardingStoreDefaults());
 }
 
 export function unlockOnboardingScreen(key: string, unlockedScreens: string[] = []) {
-	appOnboardingStore.lastActiveScreen = key;
+	onboardingStore.lastActiveScreen = key;
 	if (unlockedScreens.includes(key)) {
-		appOnboardingStore.unlockedScreens = unlockedScreens;
+		onboardingStore.unlockedScreens = unlockedScreens;
 	} else {
-		appOnboardingStore.unlockedScreens = [...unlockedScreens, key];
+		onboardingStore.unlockedScreens = [...unlockedScreens, key];
 	}
 }

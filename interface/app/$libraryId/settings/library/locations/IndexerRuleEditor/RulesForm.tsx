@@ -1,32 +1,38 @@
+import { Info, Trash } from '@phosphor-icons/react';
 import clsx from 'clsx';
-import { Trash } from 'phosphor-react';
-import { Info } from 'phosphor-react';
-import { ChangeEvent, Dispatch, SetStateAction, useId } from 'react';
-import { useCallback } from 'react';
+import { ChangeEvent, useCallback, useEffect, useId } from 'react';
 import { createPortal } from 'react-dom';
 import { Controller, FormProvider, useFieldArray } from 'react-hook-form';
-import { z } from 'zod';
-import { RuleKind, UnionToTuple, extractInfoRSPCError, useLibraryMutation } from '@sd/client';
-import { IndexerRuleCreateArgs } from '@sd/client';
-import { Button, Card, Divider, Input, Select, SelectOption, Switch, Tooltip } from '@sd/ui';
-import { ErrorMessage, Form, useZodForm } from '~/../packages/ui/src/forms';
+import {
+	extractInfoRSPCError,
+	IndexerRuleCreateArgs,
+	RuleKind,
+	UnionToTuple,
+	useLibraryMutation,
+	useZodForm
+} from '@sd/client';
+import { Button, Card, Divider, Input, Select, SelectOption, Tooltip } from '@sd/ui';
+import { ErrorMessage, Form, z } from '@sd/ui/src/forms';
+import { useLocale } from '~/hooks';
+
 import { InputKinds, RuleInput, validateInput } from './RuleInput';
 
 const ruleKinds: UnionToTuple<RuleKind> = [
 	'AcceptFilesByGlob',
 	'RejectFilesByGlob',
 	'AcceptIfChildrenDirectoriesArePresent',
-	'RejectIfChildrenDirectoriesArePresent'
+	'RejectIfChildrenDirectoriesArePresent',
+	'IgnoredByGit'
 ];
 const ruleKindEnum = z.enum(ruleKinds);
 
 const schema = z.object({
-	name: z.string().min(3),
-	kind: ruleKindEnum,
+	name: z.string().trim().min(3).max(18),
 	rules: z.array(
 		z.object({
 			type: z.string(),
-			value: z.string().min(1, { message: 'Value required' })
+			value: z.string().min(1, { message: 'Value required' }),
+			kind: ruleKindEnum
 		})
 	)
 });
@@ -34,25 +40,30 @@ const schema = z.object({
 type formType = z.infer<typeof schema>;
 
 interface Props {
-	setToggleNewRule?: Dispatch<SetStateAction<boolean>>;
+	onSubmitted?: () => void;
 }
 
-const RulesForm = ({ setToggleNewRule }: Props) => {
+const RulesForm = ({ onSubmitted }: Props) => {
 	const selectValues = ['Name', 'Extension', 'Path', 'Advanced'];
 	const REMOTE_ERROR_FORM_FIELD = 'root.serverError';
 	const createIndexerRules = useLibraryMutation(['locations.indexer_rules.create']);
 	const formId = useId();
+	const { t } = useLocale();
+	const modeOptions: { value: RuleKind; label: string }[] = [
+		{ value: 'RejectFilesByGlob', label: t('reject_files') },
+		{ value: 'AcceptFilesByGlob', label: t('accept_files') }
+	];
 	const form = useZodForm({
 		schema,
 		mode: 'onBlur',
 		reValidateMode: 'onBlur',
 		defaultValues: {
 			name: '',
-			kind: 'RejectFilesByGlob',
 			rules: [
 				{
 					type: selectValues[0],
-					value: ''
+					value: '',
+					kind: modeOptions[0]?.value
 				}
 			]
 		}
@@ -87,76 +98,78 @@ const RulesForm = ({ setToggleNewRule }: Props) => {
 		}
 	};
 
-	const addIndexerRules = useCallback(
-		async (data: formType, dryRun = false) => {
-			const formatData = {
-				kind: data.kind,
-				name: data.name,
-				dry_run: dryRun,
-				parameters: data.rules.flatMap(({ type, value }) => {
-					switch (type) {
-						case 'Name':
-							return `**/${value}`;
-						case 'Extension':
-							// .tar should work for .tar.gz, .tar.bz2, etc.
-							return [`**/*${value}`, `**/*${value}.*`];
-						default:
-							return value;
-					}
-				})
-			} as IndexerRuleCreateArgs;
-			try {
-				await createIndexerRules.mutateAsync(formatData);
-			} catch (error) {
-				const rspcErrorInfo = extractInfoRSPCError(error);
-				if (!rspcErrorInfo || rspcErrorInfo.code === 500) return false;
+	const addIndexerRules = form.handleSubmit(async (data: formType) => {
+		const formatData = {
+			name: data.name,
+			dry_run: false,
+			rules: data.rules.map(({ type, value, kind }) => {
+				switch (type) {
+					case 'Name':
+						return [kind, [`**/${value}`]];
+					case 'Extension':
+						// .tar should work for .tar.gz, .tar.bz2, etc.
+						return [kind, [`**/*${value}`, `**/*${value}.*`]];
+					default:
+						return [kind, [value]];
+				}
+			})
+		} as IndexerRuleCreateArgs;
 
-				const { message } = rspcErrorInfo;
+		try {
+			await createIndexerRules.mutateAsync(formatData);
+		} catch (error) {
+			const rspcErrorInfo = extractInfoRSPCError(error);
+			if (!rspcErrorInfo || rspcErrorInfo.code === 500) return false;
 
-				if (message)
-					form.setError(REMOTE_ERROR_FORM_FIELD, { type: 'remote', message: message });
-			} finally {
-				setToggleNewRule?.(false);
-			}
-		},
-		[createIndexerRules, setToggleNewRule, form]
-	);
+			const { message } = rspcErrorInfo;
+
+			if (message)
+				form.setError(REMOTE_ERROR_FORM_FIELD, { type: 'remote', message: message });
+		}
+	});
+
+	useEffect(() => {
+		if (form.formState.isSubmitSuccessful) onSubmitted?.();
+	}, [form.formState.isSubmitSuccessful, onSubmitted]);
 
 	return (
 		// The portal is required for Form because this component can be nested inside another form element
 		<>
 			{createPortal(
-				<Form
-					id={formId}
-					form={form}
-					onSubmit={form.handleSubmit((data) => addIndexerRules(data))}
-				/>,
+				<Form id={formId} form={form} onSubmit={addIndexerRules} />,
 				document.body
 			)}
 			<FormProvider {...form}>
-				<h3 className="mb-[15px] w-full text-sm font-semibold">Name</h3>
+				<h3 className="mb-[15px] w-full text-sm font-semibold">{t('name')}</h3>
 				<Input
 					className={errors.name && 'border border-red-500'}
 					form={formId}
 					size="md"
-					placeholder="Name"
+					placeholder={t('name')}
+					maxLength={18}
 					{...form.register('name')}
 				/>
 				{errors.name && <p className="mt-2 text-sm text-red-500">{errors.name?.message}</p>}
-				<h3 className="mb-[15px] mt-[20px] w-full text-sm font-semibold">Rules</h3>
+				<h3 className="mb-[15px] mt-[20px] w-full text-sm font-semibold">{t('rules')}</h3>
 				<div
 					className={
-						'grid space-y-1 rounded-md border border-app-line/60 bg-app-input p-2 pb-0'
+						'grid space-y-1 rounded-md border border-app-line/60 bg-app-input p-2'
 					}
 				>
-					<div className="grid grid-cols-3 px-3 pt-4 mb-4 text-sm font-bold">
-						<h3 className="pl-2">Type</h3>
-						<h3 className="pl-2">Value</h3>
+					<div className="mb-2 grid w-full grid-cols-4 items-center pt-2 text-center text-[11px] font-bold">
+						<h3>{t('type')}</h3>
+						<h3>{t('value')}</h3>
+						<h3 className="flex items-center justify-center gap-1">
+							{t('mode')}
+							<Tooltip label={t('indexer_rule_reject_allow_label')}>
+								<Info />
+							</Tooltip>
+						</h3>
 					</div>
 					{fields.map((field, index) => {
 						return (
 							<Card
-								className="grid w-full grid-cols-3 gap-3 border-app-line p-0 !px-2 hover:bg-app-box/70"
+								className="grid w-full grid-cols-4 gap-3 border-app-line p-0 !px-2 hover:bg-app-box/70"
 								key={field.id}
 							>
 								<Controller
@@ -165,7 +178,7 @@ const RulesForm = ({ setToggleNewRule }: Props) => {
 									render={({ field }) => (
 										<Select
 											{...field}
-											className="w-full"
+											className="!h-[30px] w-full"
 											onChange={(value) => {
 												field.onChange(value);
 												form.resetField(`rules.${index}.value`);
@@ -173,7 +186,7 @@ const RulesForm = ({ setToggleNewRule }: Props) => {
 										>
 											{selectValues.map((value) => (
 												<SelectOption key={value} value={value}>
-													{value}
+													{t(`${value.toLowerCase()}`)}
 												</SelectOption>
 											))}
 										</Select>
@@ -184,7 +197,7 @@ const RulesForm = ({ setToggleNewRule }: Props) => {
 									control={form.control}
 									render={({ field }) => {
 										return (
-											<div className="flex flex-col">
+											<div className="flex w-full flex-col">
 												<RuleInput
 													className={clsx(
 														'!h-[30px]',
@@ -218,15 +231,32 @@ const RulesForm = ({ setToggleNewRule }: Props) => {
 										);
 									}}
 								/>
-
+								<Controller
+									name={`rules.${index}.kind` as const}
+									render={({ field }) => (
+										<Select
+											{...field}
+											className="!h-[30px] w-full"
+											onChange={(value) => {
+												field.onChange(value);
+											}}
+										>
+											{modeOptions.map(({ label, value }) => (
+												<SelectOption key={value} value={value}>
+													{label}
+												</SelectOption>
+											))}
+										</Select>
+									)}
+									control={form.control}
+								/>
 								{index !== 0 && (
 									<Button
-										className="flex h-[32px] w-[32px] items-center
-														 justify-self-end"
+										className="flex size-[32px] items-center justify-self-end"
 										variant="gray"
 										onClick={() => remove(index)}
 									>
-										<Tooltip label="Delete rule">
+										<Tooltip label={t('delete_rule')}>
 											<Trash size={14} />
 										</Tooltip>
 									</Button>
@@ -237,49 +267,22 @@ const RulesForm = ({ setToggleNewRule }: Props) => {
 					<Button
 						onClick={() =>
 							append(
-								{ type: selectValues[0] as string, value: '' },
+								{
+									type: selectValues[0] as string,
+									value: '',
+									kind: 'RejectFilesByGlob'
+								},
 								{ shouldFocus: false }
 							)
 						}
-						className="!my-2 mx-auto w-full border
-										!border-app-line !bg-app-darkBox py-2 !font-bold
-										 hover:brightness-105"
+						className="!my-2 mx-auto w-full border !border-app-line !bg-app-darkBox py-2 !font-bold hover:brightness-105"
 					>
-						+ New
+						+
 					</Button>
 				</div>
 				<Divider className="my-[25px]" />
-				<div className="flex justify-center w-full">
-					<div className="flex items-center gap-2 mb-5">
-						<p className="text-sm text-ink-faint">Blacklist</p>
-						<Controller
-							name="kind"
-							render={({ field }) => (
-								<Switch
-									onCheckedChange={(checked) => {
-										// TODO: This rule kinds are broken right now in the backend and this UI doesn't make much sense for them
-										// kind.AcceptIfChildrenDirectoriesArePresent
-										// kind.RejectIfChildrenDirectoriesArePresent
-										const kind = ruleKindEnum.enum;
-										field.onChange(
-											checked
-												? kind.AcceptFilesByGlob
-												: kind.RejectFilesByGlob
-										);
-									}}
-									size="md"
-								/>
-							)}
-							control={form.control}
-						/>
-						<p className="text-sm text-ink-faint">Whitelist</p>
-						<Tooltip label="By default, an indexer rule acts as a deny list, causing a location to ignore any file that match its rules. Enabling this will make it act as an allow list, and the location will only display files that match its rules.">
-							<Info />
-						</Tooltip>
-					</div>
-				</div>
 				<Button form={formId} type="submit" variant="accent" className="mx-auto w-[90px]">
-					Save
+					{t('save')}
 				</Button>
 				<div className="text-center">
 					<ErrorMessage name={REMOTE_ERROR_FORM_FIELD} variant="large" className="mt-2" />

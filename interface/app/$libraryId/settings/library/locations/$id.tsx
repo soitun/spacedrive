@@ -1,257 +1,222 @@
-import { useLibraryMutation, useLibraryQuery } from '@sd/client';
-import { Button, Divider, RadioGroup, Tooltip, forms, tw } from '@sd/ui';
+import { Archive, ArrowsClockwise, Info, Trash } from '@phosphor-icons/react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Archive, ArrowsClockwise, Info, Trash } from 'phosphor-react';
-import { useState } from 'react';
+import { Suspense } from 'react';
 import { Controller } from 'react-hook-form';
 import { useNavigate } from 'react-router';
-import { showAlertDialog } from '~/components/AlertDialog';
-import { useZodRouteParams } from '~/hooks';
-import ModalLayout from '../../ModalLayout';
-import IndexerRuleEditor from './IndexerRuleEditor';
+import { useLibraryMutation, useLibraryQuery, useZodForm } from '@sd/client';
+import {
+	Button,
+	dialogManager,
+	Divider,
+	Form,
+	InfoText,
+	InputField,
+	Label,
+	RadioGroupField,
+	SwitchField,
+	toast,
+	Tooltip,
+	tw,
+	z
+} from '@sd/ui';
+import ModalLayout from '~/app/$libraryId/settings/ModalLayout';
+import { LocationIdParamsSchema } from '~/app/route-schemas';
+import { useLocale, useZodRouteParams } from '~/hooks';
 
-const Label = tw.label`mb-1 text-sm font-medium`;
+import DeleteDialog from './DeleteDialog';
+import IndexerRuleEditor from './IndexerRuleEditor';
+import { LocationPathInputField } from './PathInput';
+
 const FlexCol = tw.label`flex flex-col flex-1`;
-const InfoText = tw.p`mt-2 text-xs text-ink-faint`;
 const ToggleSection = tw.label`flex flex-row w-full`;
 
-const { Form, Input, Switch, useZodForm, z } = forms;
-
 const schema = z.object({
-	name: z.string(),
-	path: z.string(),
-	hidden: z.boolean(),
+	name: z.string().min(1).nullable(),
+	path: z.string().min(1).nullable(),
+	hidden: z.boolean().nullable(),
 	indexerRulesIds: z.array(z.number()),
 	locationType: z.string(),
-	syncPreviewMedia: z.boolean(),
-	generatePreviewMedia: z.boolean()
-});
-
-const PARAMS = z.object({
-	id: z.coerce.number().default(0)
+	syncPreviewMedia: z.boolean().nullable(),
+	generatePreviewMedia: z.boolean().nullable()
 });
 
 export const Component = () => {
-	const form = useZodForm({
-		schema,
-		defaultValues: {
-			indexerRulesIds: [],
-			locationType: 'normal',
-		}
-	});
+	return (
+		<Suspense fallback={<div></div>}>
+			<EditLocationForm />
+		</Suspense>
+	);
+};
 
-	const { id: locationId } = useZodRouteParams(PARAMS);
-
+const EditLocationForm = () => {
+	const { id: locationId } = useZodRouteParams(LocationIdParamsSchema);
 	const navigate = useNavigate();
 	const fullRescan = useLibraryMutation('locations.fullRescan');
 	const queryClient = useQueryClient();
-	const [isFirstLoad, setIsFirstLoad] = useState(true);
-	const [toggleNewRule, setToggleNewRule] = useState(false);
+
+	const locationDataQuery = useLibraryQuery(['locations.getWithRules', locationId], {
+		suspense: true
+	});
+	const locationData = locationDataQuery.data;
+
+	const form = useZodForm({
+		schema,
+		defaultValues: {
+			indexerRulesIds: locationData?.indexer_rules.map((rule) => rule.id) ?? [],
+			locationType: 'normal',
+			name: locationData?.name ?? '',
+			path: locationData?.path ?? '',
+			hidden: locationData?.hidden ?? false,
+			syncPreviewMedia: locationData?.sync_preview_media ?? false,
+			generatePreviewMedia: locationData?.generate_preview_media ?? false
+		}
+	});
+
 	const updateLocation = useLibraryMutation('locations.update', {
 		onError: () => {
-			showAlertDialog({
-				title: 'Error',
-				value: 'Failed to update location settings'
-			});
+			toast.error(t('failed_to_update_location_settings'));
 		},
 		onSuccess: () => {
 			form.reset(form.getValues());
-			queryClient.invalidateQueries(['locations.list']);
+			queryClient.invalidateQueries({ queryKey: ['locations.list'] });
 		}
 	});
 
-	const { isDirty } = form.formState;
-
-	useLibraryQuery(['locations.getWithRules', locationId], {
-		onSettled: (data, error) => {
-			if (isFirstLoad) {
-				// @ts-expect-error // TODO: Fix the types
-				if (!data && error == null) error = new Error('Failed to load location settings');
-
-				// Return to previous page when no data is available at first load
-				if (error) navigate(-1);
-				else setIsFirstLoad(false);
-			}
-
-			if (error) {
-				showAlertDialog({
-					title: 'Error',
-					value: 'Failed to load location settings'
-				});
-			} else if (data && (isFirstLoad || !isDirty)) {
-				form.reset({
-					path: data.path,
-					name: data.name,
-					hidden: data.hidden,
-					locationType: 'normal', // temp
-					indexerRulesIds: data.indexer_rules.map((i) => i.indexer_rule.id),
-					syncPreviewMedia: data.sync_preview_media,
-					generatePreviewMedia: data.generate_preview_media
-				});
-			}
-		}
-	});
-
-	const onSubmit = form.handleSubmit(
-		({ name, hidden, indexerRulesIds, syncPreviewMedia, generatePreviewMedia }) =>
-			updateLocation.mutateAsync({
-				id: locationId,
-				name,
-				hidden,
-				indexer_rules_ids: indexerRulesIds,
-				sync_preview_media: syncPreviewMedia,
-				generate_preview_media: generatePreviewMedia
-			})
+	const onSubmit = form.handleSubmit((data) =>
+		updateLocation.mutateAsync({
+			id: locationId,
+			path: data.path,
+			name: data.name,
+			hidden: data.hidden,
+			indexer_rules_ids: data.indexerRulesIds,
+			sync_preview_media: data.syncPreviewMedia,
+			generate_preview_media: data.generatePreviewMedia
+		})
 	);
 
+	const { t } = useLocale();
+
 	return (
-		<Form form={form} disabled={isFirstLoad} onSubmit={onSubmit} className="h-full w-full">
+		<Form form={form} onSubmit={onSubmit} className="size-full">
 			<ModalLayout
-				title="Edit Location"
+				title={t('edit_location')}
 				topRight={
 					<div className="flex flex-row space-x-3">
-						{isDirty && (
+						{form.formState.isDirty && (
 							<Button onClick={() => form.reset()} variant="outline" size="sm">
-								Reset
+								{t('reset')}
 							</Button>
 						)}
 						<Button
 							type="submit"
-							disabled={!isDirty || form.formState.isSubmitting}
-							variant={isDirty ? 'accent' : 'outline'}
+							disabled={!form.formState.isDirty || form.formState.isSubmitting}
+							variant={form.formState.isDirty ? 'accent' : 'outline'}
 							size="sm"
 						>
-							Save Changes
+							{t('save_changes')}
 						</Button>
 					</div>
 				}
 			>
 				<div className="flex space-x-4">
 					<FlexCol>
-						<Input label="Display Name" {...form.register('name')} />
-						<InfoText>
-							The name of this Location, this is what will be displayed in the
-							sidebar. Will not rename the actual folder on disk.
-						</InfoText>
+						<InputField label={t('display_name')} {...form.register('name')} />
+						<InfoText className="mt-2">{t('location_display_name_info')}</InfoText>
 					</FlexCol>
 					<FlexCol>
-						<Input
-							label="Local Path"
-							readOnly={true}
-							className="text-ink-dull"
-							{...form.register('path')}
-						/>
-						<InfoText>
-							The path to this Location, this is where the files will be stored on
-							disk.
-						</InfoText>
+						<LocationPathInputField label={t('path')} {...form.register('path')} />
+						<InfoText className="mt-2">{t('location_path_info')}</InfoText>
 					</FlexCol>
 				</div>
 				<Divider />
 				<div className="space-y-2">
-					<Label className="grow">Location Type</Label>
-					<RadioGroup.Root className='flex flex-row !space-y-0 space-x-2' {...form.register('locationType')}>
-						<RadioGroup.Item key="normal" value="normal">
-							<h1 className="font-bold">Normal</h1>
-							<p className="text-sm text-ink-faint">Contents will be indexed as-is, new files will not be automatically sorted.</p>
-						</RadioGroup.Item>
-						<span className='opacity-30'>
-							<RadioGroup.Item disabled key="managed" value="managed">
-								<h1 className="font-bold">Managed</h1>
-								<p className="text-sm text-ink-faint">Spacedrive will sort files for you, based on rules you define. Location must be empty to start.</p>
-							</RadioGroup.Item>
-						</span>
-						<span className='opacity-30'>
-							<RadioGroup.Item disabled key="replica" value="replica">
-								<h1 className="font-bold">Replica</h1>
-								<p className="text-sm text-ink-faint">This Location is a replica of another, it will be automatically synchronized</p>
-							</RadioGroup.Item>
-						</span>
-					</RadioGroup.Root>
+					<Label className="grow">{t('location_type')}</Label>
+					<RadioGroupField.Root
+						className="flex flex-row !space-y-0 space-x-2"
+						{...form.register('locationType')}
+					>
+						<RadioGroupField.Item key="normal" value="normal">
+							<h1 className="font-bold">{t('normal')}</h1>
+							<p className="text-sm text-ink-faint">{t('location_type_normal')}</p>
+						</RadioGroupField.Item>
 
+						<RadioGroupField.Item disabled key="managed" value="managed">
+							<h1 className="font-bold">{t('managed')}</h1>
+							<p className="text-sm text-ink-faint">{t('location_type_managed')}</p>
+						</RadioGroupField.Item>
+
+						<RadioGroupField.Item disabled key="replica" value="replica">
+							<h1 className="font-bold">{t('replica')}</h1>
+							<p className="text-sm text-ink-faint">{t('location_type_replica')}</p>
+						</RadioGroupField.Item>
+					</RadioGroupField.Root>
 				</div>
 				<Divider />
 				<div className="space-y-2">
 					<ToggleSection>
-						<Label className="grow">Generate preview media for this Location</Label>
-						<Switch {...form.register('generatePreviewMedia')} size="sm" />
+						<Label className="grow">{t('generate_preview_media_label')}</Label>
+						<SwitchField {...form.register('generatePreviewMedia')} size="sm" />
+					</ToggleSection>
+					<ToggleSection>
+						<Label className="grow">{t('sync_preview_media_label')}</Label>
+						<SwitchField {...form.register('syncPreviewMedia')} size="sm" />
 					</ToggleSection>
 					<ToggleSection>
 						<Label className="grow">
-							Sync preview media for this Location with your devices
-						</Label>
-						<Switch {...form.register('syncPreviewMedia')} size="sm" />
-					</ToggleSection>
-					<ToggleSection>
-						<Label className="grow">
-							Hide location and contents from view{' '}
-							<Tooltip label='Prevents the location and its contents from appearing in summary categories, search and tags unless "Show hidden items" is enabled.'>
+							{t('hide_location_from_view')}{' '}
+							<Tooltip label={t('hidden_label')}>
 								<Info className="inline" />
 							</Tooltip>
 						</Label>
-						<Switch {...form.register('hidden')} size="sm" />
+						<SwitchField {...form.register('hidden')} size="sm" />
 					</ToggleSection>
 				</div>
 				<Divider />
-				<div className="flex flex-col rounded-md border border-app-line bg-app-overlay px-5 py-5">
-					<div className="flex w-full items-start justify-between">
-						<div>
-							<Label className="!mb-2 grow !text-sm !font-bold">Indexer rules</Label>
-							<InfoText className="!mt-0 mb-4">
-								Indexer rules allow you to specify paths to ignore using RegEx.
-							</InfoText>
-						</div>
-						<Button
-							onClick={() => setToggleNewRule(!toggleNewRule)}
-							className="px-5"
-							variant="accent"
-						>
-							+ New
-						</Button>
-					</div>
-					<Controller
-						name="indexerRulesIds"
-						render={({ field }) => (
-							<IndexerRuleEditor
-								setToggleNewRule={setToggleNewRule}
-								toggleNewRule={toggleNewRule}
-								field={field}
-							/>
-						)}
-						control={form.control}
-					/>
-				</div>
+				<Controller
+					name="indexerRulesIds"
+					render={({ field }) => (
+						<IndexerRuleEditor
+							field={field}
+							label={t('indexer_rules')}
+							editable={true}
+							infoText={t('indexer_rules_info')}
+							className="flex flex-col rounded-md border border-app-line bg-app-overlay p-5"
+						/>
+					)}
+					control={form.control}
+				/>
 				<Divider />
 				<div className="flex space-x-5">
 					<FlexCol>
 						<div>
 							<Button
-								onClick={() => fullRescan.mutate(locationId)}
+								onClick={() =>
+									fullRescan.mutate({
+										location_id: locationId,
+										reidentify_objects: true
+									})
+								}
 								size="sm"
 								variant="outline"
 							>
-								<ArrowsClockwise className="-mt-0.5 mr-1.5 inline h-4 w-4" />
-								Full Reindex
+								<ArrowsClockwise className="-mt-0.5 mr-1.5 inline size-4" />
+								{t('full_reindex')}
 							</Button>
 						</div>
-						<InfoText>Perform a full rescan of this Location.</InfoText>
+						<InfoText className="mt-2">{t('full_reindex_info')}</InfoText>
 					</FlexCol>
 					<FlexCol>
 						<div>
 							<Button
-								onClick={() => alert('Archiving locations is coming soon...')}
+								onClick={() => toast.info(t('archive_coming_soon'))}
 								size="sm"
 								variant="outline"
-								className=""
 							>
-								<Archive className="-mt-0.5 mr-1.5 inline h-4 w-4" />
-								Archive
+								<Archive className="-mt-0.5 mr-1.5 inline size-4" />
+								{t('archive')}
 							</Button>
 						</div>
-						<InfoText>
-							Extract data from Library as an archive, useful to preserve Location
-							folder structure.
-						</InfoText>
+						<InfoText className="mt-2">{t('archive_info')}</InfoText>
 					</FlexCol>
 					<FlexCol>
 						<div>
@@ -259,14 +224,22 @@ export const Component = () => {
 								size="sm"
 								variant="colored"
 								className="border-red-500 bg-red-500"
+								onClick={(e: { stopPropagation: () => void }) => {
+									e.stopPropagation();
+									dialogManager.create((dp) => (
+										<DeleteDialog
+											{...dp}
+											onSuccess={() => navigate(-1)}
+											locationId={locationId}
+										/>
+									));
+								}}
 							>
-								<Trash className="-mt-0.5 mr-1.5 inline h-4 w-4" />
-								Delete
+								<Trash className="-mt-0.5 mr-1.5 inline size-4" />
+								{t('delete')}
 							</Button>
 						</div>
-						<InfoText>
-							This will not delete the actual folder on disk. Preview media will be
-						</InfoText>
+						<InfoText className="mt-2">{t('delete_info')}</InfoText>
 					</FlexCol>
 				</div>
 				<Divider />

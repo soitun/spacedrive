@@ -2,169 +2,322 @@ use crate::{
 	invalidate_query,
 	library::Library,
 	location::{
-		delete_directory,
-		file_path_helper::{
-			check_existing_file_path, create_file_path, file_path_with_object,
-			filter_existing_file_path_params, get_parent_dir,
-			isolated_file_path_data::extract_normalized_materialized_path_str,
-			loose_find_existing_file_path_params, FilePathError, FilePathMetadata,
-			IsolatedFilePathData, MetadataExt,
-		},
-		find_location, location_with_indexer_rules,
-		manager::LocationManagerError,
-		scan_location_sub_path, LocationId,
+		create_file_path, delete_directory, find_location,
+		indexer::reverse_update_directories_sizes, location_with_indexer_rules,
+		manager::LocationManagerError, scan_location_sub_path, update_location_size,
 	},
-	object::{
-		file_identifier::FileMetadata,
-		object_just_id_has_thumbnail,
-		preview::{can_generate_thumbnail_for_image, generate_image_thumbnail, get_thumbnail_path},
-		validation::hash::file_checksum,
+	object::validation::hash::file_checksum,
+	Node,
+};
+
+use sd_core_file_path_helper::{
+	check_file_path_exists, filter_existing_file_path_params,
+	isolated_file_path_data::extract_normalized_materialized_path_str,
+	loose_find_existing_file_path_params, path_is_hidden, FilePathError, FilePathMetadata,
+	IsolatedFilePathData, MetadataExt,
+};
+use sd_core_heavy_lifting::{
+	file_identifier::FileMetadata,
+	media_processor::{
+		exif_media_data, ffmpeg_media_data, generate_single_thumbnail, get_thumbnails_directory,
+		ThumbnailKind,
 	},
-	prisma::{file_path, location, object},
-	sync,
-	util::error::FileIOError,
+};
+use sd_core_indexer_rules::{
+	seed::{GitIgnoreRules, GITIGNORE},
+	IndexerRuler, RulerDecision,
+};
+use sd_core_prisma_helpers::{
+	file_path_watcher_remove, file_path_with_object, object_ids, CasId, ObjectPubId,
+};
+
+use sd_file_ext::{
+	extensions::{AudioExtension, ImageExtension, VideoExtension},
+	kind::ObjectKind,
+};
+use sd_prisma::{
+	prisma::{device, file_path, location, object},
+	prisma_sync,
+};
+use sd_sync::{option_sync_db_entry, sync_db_entry, sync_entry, OperationFactory};
+use sd_utils::{
+	chain_optional_iter,
+	db::{inode_from_db, inode_to_db, maybe_missing, size_in_bytes_to_db},
+	error::FileIOError,
 };
 
 #[cfg(target_family = "unix")]
-use crate::location::file_path_helper::get_inode_and_device;
+use sd_core_file_path_helper::get_inode;
 
 #[cfg(target_family = "windows")]
-use crate::location::file_path_helper::get_inode_and_device_from_path;
+use sd_core_file_path_helper::get_inode_from_path;
 
 use std::{
-	collections::HashSet,
+	collections::{HashMap, HashSet},
+	ffi::OsStr,
 	fs::Metadata,
 	path::{Path, PathBuf},
 	str::FromStr,
+	sync::Arc,
 };
 
-use sd_file_ext::extensions::ImageExtension;
+use chrono::{DateTime, FixedOffset, Local, Utc};
+use futures_concurrency::future::Join;
+use notify::Event;
+use tokio::{
+	fs,
+	io::{self, ErrorKind},
+	spawn,
+	time::{sleep, Instant},
+};
+use tracing::{error, instrument, trace, warn};
 
-use chrono::{DateTime, Local};
-use notify::{Event, EventKind};
-use prisma_client_rust::{raw, PrismaValue};
-use serde_json::json;
-use tokio::{fs, io::ErrorKind};
-use tracing::{debug, error, info, trace, warn};
-use uuid::Uuid;
+use super::{INode, HUNDRED_MILLIS, ONE_SECOND};
 
-use super::INodeAndDevice;
-
-pub(super) fn check_event(event: &Event, ignore_paths: &HashSet<PathBuf>) -> bool {
+pub(super) async fn reject_event(
+	event: &Event,
+	ignore_paths: &HashSet<PathBuf>,
+	location_path: Option<&Path>,
+	indexer_ruler: Option<&IndexerRuler>,
+) -> bool {
 	// if path includes .DS_Store, .spacedrive file creation or is in the `ignore_paths` set, we ignore
-	!event.paths.iter().any(|p| {
-		let path_str = p.to_str().expect("Found non-UTF-8 path");
-
-		path_str.contains(".DS_Store")
-			|| (path_str.contains(".spacedrive") && matches!(event.kind, EventKind::Create(_)))
+	if event.paths.iter().any(|p| {
+		p.file_name()
+			.and_then(OsStr::to_str)
+			.map_or(false, |name| name == ".DS_Store" || name == ".spacedrive")
 			|| ignore_paths.contains(p)
-	})
+	}) {
+		trace!("Rejected by ignored paths");
+		return true;
+	}
+
+	if let Some(indexer_ruler) = indexer_ruler {
+		let ruler_decisions = event
+			.paths
+			.iter()
+			.map(|path| async move { (path, fs::metadata(path).await) })
+			.collect::<Vec<_>>()
+			.join()
+			.await
+			.into_iter()
+			.filter_map(|(path, res)| {
+				res.map(|metadata| (path, metadata))
+					.map_err(|e| {
+						if e.kind() != ErrorKind::NotFound {
+							error!(?e, path = %path.display(), "Failed to get metadata for path;");
+						}
+					})
+					.ok()
+			})
+			.map(|(path, metadata)| {
+				let mut independent_ruler = indexer_ruler.clone();
+
+				async move {
+					let path_to_check_gitignore = if metadata.is_dir() {
+						Some(path.as_path())
+					} else {
+						path.parent()
+					};
+
+					if let (Some(path_to_check_gitignore), Some(location_path)) =
+						(path_to_check_gitignore, location_path.as_ref())
+					{
+						if independent_ruler.has_system(&GITIGNORE) {
+							if let Some(rules) = GitIgnoreRules::get_rules_if_in_git_repo(
+								location_path,
+								path_to_check_gitignore,
+							)
+							.await
+							{
+								trace!("Found gitignore rules to follow");
+								independent_ruler.extend(rules.map(Into::into));
+							}
+						}
+					}
+
+					independent_ruler.evaluate_path(path, &metadata).await
+				}
+			})
+			.collect::<Vec<_>>()
+			.join()
+			.await;
+
+		if !ruler_decisions.is_empty()
+			&& ruler_decisions.into_iter().all(|res| {
+				matches!(
+					res.map_err(|e| trace!(?e, "Failed to evaluate path;"))
+						// In case of error, we accept the path as a safe default
+						.unwrap_or(RulerDecision::Accept),
+					RulerDecision::Reject
+				)
+			}) {
+			trace!("Rejected by indexer ruler");
+			return true;
+		}
+	}
+
+	false
 }
 
+#[instrument(skip_all, fields(path = %path.as_ref().display()), err)]
 pub(super) async fn create_dir(
-	location_id: LocationId,
-	path: impl AsRef<Path>,
+	location_id: location::id::Type,
+	path: impl AsRef<Path> + Send,
 	metadata: &Metadata,
-	library: &Library,
+	node: &Arc<Node>,
+	library: &Arc<Library>,
 ) -> Result<(), LocationManagerError> {
 	let location = find_location(library, location_id)
 		.include(location_with_indexer_rules::include())
 		.exec()
 		.await?
-		.ok_or(LocationManagerError::MissingLocation(location_id))?;
+		.ok_or(LocationManagerError::LocationNotFound(location_id))?;
 
 	let path = path.as_ref();
 
-	trace!(
-		"Location: <root_path ='{}'> creating directory: {}",
-		location.path,
-		path.display()
-	);
+	let location_path = maybe_missing(&location.path, "location.path")?;
 
-	let materialized_path = IsolatedFilePathData::new(location.id, &location.path, path, true)?;
+	trace!(new_directory = %path.display(), "Creating directory;");
 
-	let (inode, device) = {
-		#[cfg(target_family = "unix")]
-		{
-			get_inode_and_device(metadata)?
-		}
+	let iso_file_path = IsolatedFilePathData::new(location.id, location_path, path, true)?;
 
-		#[cfg(target_family = "windows")]
-		{
-			// FIXME: This is a workaround for Windows, because we can't get the inode and device from the metadata
-			let _ = metadata; // To avoid unused variable warning
-			get_inode_and_device_from_path(&path).await?
-		}
-	};
+	let parent_iso_file_path = iso_file_path.parent();
+	if !parent_iso_file_path.is_root()
+		&& !check_file_path_exists::<FilePathError>(&parent_iso_file_path, &library.db).await?
+	{
+		warn!(%iso_file_path, "Watcher found a directory without parent;");
 
-	let parent_directory = get_parent_dir(&materialized_path, &library.db).await?;
-
-	trace!("parent_directory: {:?}", parent_directory);
-
-	if parent_directory.is_none() {
-		warn!("Watcher found a directory without parent");
 		return Ok(());
 	};
 
-	let created_path = create_file_path(
+	let children_materialized_path = iso_file_path
+		.materialized_path_for_children()
+		.expect("We're in the create dir function lol");
+
+	create_file_path(
 		library,
-		materialized_path,
+		iso_file_path.to_parts(),
 		None,
-		FilePathMetadata {
-			inode,
-			device,
-			size_in_bytes: metadata.len(),
-			created_at: metadata.created_or_now().into(),
-			modified_at: metadata.modified_or_now().into(),
-		},
+		FilePathMetadata::from_path(path, metadata)?,
 	)
 	.await?;
 
-	info!("Created path: {}", created_path.materialized_path);
+	spawn({
+		let node = Arc::clone(node);
+		let library = Arc::clone(library);
 
-	// scan the new directory
-	scan_location_sub_path(library, location, &created_path.materialized_path).await?;
+		async move {
+			// Wait a bit for any files being moved into the new directory to be indexed by the watcher
+			sleep(ONE_SECOND).await;
+
+			trace!(%iso_file_path, "Scanning new directory;");
+
+			// scan the new directory
+			if let Err(e) =
+				scan_location_sub_path(&node, &library, location, &children_materialized_path).await
+			{
+				error!(?e, "Failed to scan new directory;");
+			}
+		}
+	});
 
 	invalidate_query!(library, "search.paths");
+	invalidate_query!(library, "search.objects");
 
 	Ok(())
 }
 
+#[instrument(skip_all, fields(path = %path.as_ref().display()), err)]
 pub(super) async fn create_file(
-	location_id: LocationId,
-	path: impl AsRef<Path>,
+	location_id: location::id::Type,
+	path: impl AsRef<Path> + Send,
 	metadata: &Metadata,
-	library: &Library,
+	node: &Arc<Node>,
+	library: &Arc<Library>,
+) -> Result<(), LocationManagerError> {
+	inner_create_file(
+		location_id,
+		extract_location_path(location_id, library).await?,
+		path,
+		metadata,
+		node,
+		library,
+	)
+	.await
+}
+
+async fn inner_create_file(
+	location_id: location::id::Type,
+	location_path: impl AsRef<Path> + Send,
+	path: impl AsRef<Path> + Send,
+	metadata: &Metadata,
+	node: &Arc<Node>,
+	library @ Library {
+		id: library_id,
+		db,
+		sync,
+		..
+	}: &Library,
 ) -> Result<(), LocationManagerError> {
 	let path = path.as_ref();
-	let location_path = extract_location_path(location_id, library).await?;
+	let location_path = location_path.as_ref();
 
-	trace!(
-		"Location: <root_path ='{}'> creating file: {}",
-		location_path.display(),
-		path.display()
-	);
+	trace!(new_file = %path.display(), "Creating file;");
 
-	let db = &library.db;
+	let iso_file_path = IsolatedFilePathData::new(location_id, location_path, path, false)?;
+	let iso_file_path_parts = iso_file_path.to_parts();
+	let extension = iso_file_path_parts.extension.to_string();
 
-	let iso_file_path = IsolatedFilePathData::new(location_id, &location_path, path, false)?;
+	let metadata = FilePathMetadata::from_path(path, metadata)?;
 
-	let (inode, device) = {
-		#[cfg(target_family = "unix")]
-		{
-			get_inode_and_device(metadata)?
-		}
+	// First we check if already exist a file with this same inode number
+	// if it does, we just update it
+	if let Some(file_path) = db
+		.file_path()
+		.find_unique(file_path::location_id_inode(
+			location_id,
+			inode_to_db(metadata.inode),
+		))
+		.include(file_path_with_object::include())
+		.exec()
+		.await?
+	{
+		trace!(%iso_file_path, "File already exists with that inode;");
 
-		#[cfg(target_family = "windows")]
-		{
-			// FIXME: This is a workaround for Windows, because we can't get the inode and device from the metadata
-			let _ = metadata; // To avoid unused variable warning
-			get_inode_and_device_from_path(path).await?
-		}
-	};
+		return inner_update_file(location_path, &file_path, path, node, library, None).await;
 
-	if get_parent_dir(&iso_file_path, db).await?.is_none() {
-		warn!("Watcher found a file without parent");
+	// If we can't find an existing file with the same inode, we check if there is a file with the same path
+	} else if let Some(file_path) = db
+		.file_path()
+		.find_unique(file_path::location_id_materialized_path_name_extension(
+			location_id,
+			iso_file_path_parts.materialized_path.to_string(),
+			iso_file_path_parts.name.to_string(),
+			iso_file_path_parts.extension.to_string(),
+		))
+		.include(file_path_with_object::include())
+		.exec()
+		.await?
+	{
+		trace!(%iso_file_path, "File already exists with that iso_file_path;");
+
+		return inner_update_file(
+			location_path,
+			&file_path,
+			path,
+			node,
+			library,
+			Some(metadata.inode),
+		)
+		.await;
+	}
+
+	let parent_iso_file_path = iso_file_path.parent();
+	if !parent_iso_file_path.is_root()
+		&& !check_file_path_exists::<FilePathError>(&parent_iso_file_path, db).await?
+	{
+		warn!(%iso_file_path, "Watcher found a file without parent;");
+
 		return Ok(());
 	};
 
@@ -173,100 +326,200 @@ pub(super) async fn create_file(
 		cas_id,
 		kind,
 		fs_metadata,
-	} = FileMetadata::new(&location_path, &iso_file_path)
-		.await
-		.map_err(|e| FileIOError::from((location_path.join(&iso_file_path), e)))?;
+	} = FileMetadata::new(&location_path, &iso_file_path).await?;
 
-	let created_file = create_file_path(
-		library,
-		iso_file_path,
-		Some(cas_id.clone()),
-		FilePathMetadata {
-			inode,
-			device,
-			size_in_bytes: metadata.len(),
-			created_at: metadata.created_or_now().into(),
-			modified_at: metadata.modified_or_now().into(),
-		},
-	)
-	.await?;
-
-	info!("Created path: {}", created_file.materialized_path);
+	let created_file =
+		create_file_path(library, iso_file_path_parts, cas_id.clone(), metadata).await?;
 
 	let existing_object = db
 		.object()
 		.find_first(vec![object::file_paths::some(vec![
-			file_path::cas_id::equals(Some(cas_id.clone())),
+			file_path::cas_id::equals(cas_id.clone().map(Into::into)),
 			file_path::pub_id::not(created_file.pub_id.clone()),
 		])])
-		.select(object_just_id_has_thumbnail::select())
+		.select(object_ids::select())
 		.exec()
 		.await?;
 
-	let object = if let Some(object) = existing_object {
+	let is_new_file = existing_object.is_none();
+
+	let object_ids::Data {
+		id: object_id,
+		pub_id: object_pub_id,
+	} = if let Some(object) = existing_object {
 		object
 	} else {
-		db.object()
-			.create(
-				Uuid::new_v4().as_bytes().to_vec(),
-				vec![
-					object::date_created::set(
-						DateTime::<Local>::from(fs_metadata.created_or_now()).into(),
-					),
-					object::kind::set(kind as i32),
-				],
-			)
-			.select(object_just_id_has_thumbnail::select())
-			.exec()
-			.await?
+		let pub_id: ObjectPubId = ObjectPubId::new();
+		let date_created: DateTime<FixedOffset> =
+			DateTime::<Local>::from(fs_metadata.created_or_now()).into();
+		let int_kind = kind as i32;
+
+		let device_pub_id = sync.device_pub_id.to_db();
+
+		let (sync_params, db_params) = [
+			sync_db_entry!(date_created, object::date_created),
+			sync_db_entry!(int_kind, object::kind),
+			(
+				sync_entry!(
+					prisma_sync::device::SyncId {
+						pub_id: device_pub_id.clone()
+					},
+					object::device
+				),
+				object::device::connect(device::pub_id::equals(device_pub_id)),
+			),
+		]
+		.into_iter()
+		.unzip::<_, _, Vec<_>, Vec<_>>();
+
+		sync.write_op(
+			db,
+			sync.shared_create(
+				prisma_sync::object::SyncId {
+					pub_id: pub_id.to_db(),
+				},
+				sync_params,
+			),
+			db.object()
+				.create(pub_id.into(), db_params)
+				.select(object_ids::select()),
+		)
+		.await?
 	};
 
-	db.file_path()
-		.update(
-			file_path::pub_id::equals(created_file.pub_id),
-			vec![file_path::object::connect(object::id::equals(object.id))],
-		)
-		.exec()
-		.await?;
+	sync.write_op(
+		db,
+		sync.shared_update(
+			prisma_sync::location::SyncId {
+				pub_id: created_file.pub_id.clone(),
+			},
+			[sync_entry!(
+				prisma_sync::object::SyncId {
+					pub_id: object_pub_id.clone()
+				},
+				file_path::object
+			)],
+		),
+		db.file_path()
+			.update(
+				file_path::pub_id::equals(created_file.pub_id.clone()),
+				vec![file_path::object::connect(object::pub_id::equals(
+					object_pub_id.clone(),
+				))],
+			)
+			.select(file_path::select!({ id })),
+	)
+	.await?;
 
-	if !object.has_thumbnail && !created_file.extension.is_empty() {
+	// If the file is a duplicate of an existing file, we don't need to generate thumbnails nor extract media data
+	if is_new_file
+		&& !extension.is_empty()
+		&& matches!(
+			kind,
+			ObjectKind::Image | ObjectKind::Video | ObjectKind::Audio
+		) {
 		// Running in a detached task as thumbnail generation can take a while and we don't want to block the watcher
-		let path = path.to_path_buf();
-		let library = library.clone();
-		tokio::spawn(async move {
-			generate_thumbnail(&created_file.extension, &cas_id, path, &library).await;
-		});
+		if matches!(kind, ObjectKind::Image | ObjectKind::Video) {
+			if let Some(cas_id) = cas_id {
+				spawn({
+					let extension = extension.clone();
+					let path = path.to_path_buf();
+					let thumbnails_directory =
+						get_thumbnails_directory(node.config.data_directory());
+					let library_id = *library_id;
+
+					async move {
+						if let Err(e) = generate_single_thumbnail(
+							&thumbnails_directory,
+							extension,
+							cas_id,
+							path,
+							ThumbnailKind::Indexed(library_id),
+						)
+						.await
+						{
+							error!(?e, "Failed to generate thumbnail in the watcher;");
+						}
+					}
+				});
+			}
+		}
+
+		match kind {
+			ObjectKind::Image => {
+				if let Ok(image_extension) = ImageExtension::from_str(&extension) {
+					if exif_media_data::can_extract(image_extension) {
+						if let Ok(Some(exif_data)) = exif_media_data::extract(path)
+							.await
+							.map_err(|e| error!(?e, "Failed to extract image media data;"))
+						{
+							exif_media_data::save(
+								[(exif_data, object_id, object_pub_id.into())],
+								db,
+								sync,
+							)
+							.await?;
+						}
+					}
+				}
+			}
+
+			ObjectKind::Audio => {
+				if let Ok(audio_extension) = AudioExtension::from_str(&extension) {
+					if ffmpeg_media_data::can_extract_for_audio(audio_extension) {
+						if let Ok(ffmpeg_data) = ffmpeg_media_data::extract(path)
+							.await
+							.map_err(|e| error!(?e, "Failed to extract audio media data;"))
+						{
+							ffmpeg_media_data::save([(ffmpeg_data, object_id)], db).await?;
+						}
+					}
+				}
+			}
+
+			ObjectKind::Video => {
+				if let Ok(video_extension) = VideoExtension::from_str(&extension) {
+					if ffmpeg_media_data::can_extract_for_video(video_extension) {
+						if let Ok(ffmpeg_data) = ffmpeg_media_data::extract(path)
+							.await
+							.map_err(|e| error!(?e, "Failed to extract video media data;"))
+						{
+							ffmpeg_media_data::save([(ffmpeg_data, object_id)], db).await?;
+						}
+					}
+				}
+			}
+
+			_ => {
+				// Do nothing
+			}
+		}
 	}
 
 	invalidate_query!(library, "search.paths");
+	invalidate_query!(library, "search.objects");
 
 	Ok(())
 }
 
-pub(super) async fn create_dir_or_file(
-	location_id: LocationId,
-	path: impl AsRef<Path>,
-	library: &Library,
-) -> Result<Metadata, LocationManagerError> {
-	let path = path.as_ref();
-	let metadata = fs::metadata(path)
-		.await
-		.map_err(|e| FileIOError::from((path, e)))?;
-
-	if metadata.is_dir() {
-		create_dir(location_id, path, &metadata, library).await
-	} else {
-		create_file(location_id, path, &metadata, library).await
-	}
-	.map(|_| metadata)
-}
-
-pub(super) async fn file_creation_or_update(
-	location_id: LocationId,
-	full_path: impl AsRef<Path>,
-	library: &Library,
+#[instrument(skip_all, fields(path = %path.as_ref().display()), err)]
+pub(super) async fn update_file(
+	location_id: location::id::Type,
+	path: impl AsRef<Path> + Send,
+	node: &Arc<Node>,
+	library: &Arc<Library>,
 ) -> Result<(), LocationManagerError> {
-	let full_path = full_path.as_ref();
+	let full_path = path.as_ref();
+
+	let metadata = match fs::metadata(full_path).await {
+		Ok(metadata) => metadata,
+		Err(e) if e.kind() == io::ErrorKind::NotFound => {
+			// If the file doesn't exist anymore, it was just a temporary file
+			return Ok(());
+		}
+		Err(e) => return Err(FileIOError::from((full_path, e)).into()),
+	};
+
 	let location_path = extract_location_path(location_id, library).await?;
 
 	if let Some(ref file_path) = library
@@ -280,198 +533,356 @@ pub(super) async fn file_creation_or_update(
 		.exec()
 		.await?
 	{
-		inner_update_file(location_id, file_path, full_path, library).await
+		inner_update_file(location_path, file_path, full_path, node, library, None).await
 	} else {
-		create_file(
+		inner_create_file(
 			location_id,
+			location_path,
 			full_path,
-			&fs::metadata(full_path)
-				.await
-				.map_err(|e| FileIOError::from((full_path, e)))?,
+			&metadata,
+			node,
 			library,
 		)
 		.await
 	}
-}
-
-pub(super) async fn update_file(
-	location_id: LocationId,
-	full_path: impl AsRef<Path>,
-	library: &Library,
-) -> Result<(), LocationManagerError> {
-	let full_path = full_path.as_ref();
-	let location_path = extract_location_path(location_id, library).await?;
-
-	if let Some(ref file_path) = library
-		.db
-		.file_path()
-		.find_first(filter_existing_file_path_params(
-			&IsolatedFilePathData::new(location_id, &location_path, full_path, false)?,
-		))
-		// include object for orphan check
-		.include(file_path_with_object::include())
-		.exec()
-		.await?
-	{
-		let ret = inner_update_file(location_id, file_path, full_path, library).await;
+	.map(|()| {
 		invalidate_query!(library, "search.paths");
-		ret
-	} else {
-		// FIXME(fogodev): Have to handle files excluded by indexer rules
-		Err(LocationManagerError::UpdateNonExistingFile(
-			full_path.to_path_buf(),
-		))
-	}
+		invalidate_query!(library, "search.objects");
+	})
 }
 
 async fn inner_update_file(
-	location_id: LocationId,
+	location_path: impl AsRef<Path> + Send,
 	file_path: &file_path_with_object::Data,
-	full_path: impl AsRef<Path>,
+	full_path: impl AsRef<Path> + Send,
+	node: &Arc<Node>,
 	library @ Library { db, sync, .. }: &Library,
+	maybe_new_inode: Option<INode>,
 ) -> Result<(), LocationManagerError> {
 	let full_path = full_path.as_ref();
-	let location = db
-		.location()
-		.find_unique(location::id::equals(location_id))
-		.exec()
-		.await?
-		.ok_or_else(|| LocationManagerError::MissingLocation(location_id))?;
+	let location_path = location_path.as_ref();
 
-	let location_path = PathBuf::from(location.path);
+	let current_inode =
+		inode_from_db(&maybe_missing(file_path.inode.as_ref(), "file_path.inode")?[0..8]);
 
 	trace!(
-		"Location: <root_path ='{}'> updating file: {}",
-		location_path.display(),
-		full_path.display()
+		location_path = %location_path.display(),
+		path = %full_path.display(),
+		"Updating file;",
 	);
 
-	let iso_file_path = IsolatedFilePathData::from(file_path);
+	let iso_file_path = IsolatedFilePathData::try_from(file_path)?;
 
 	let FileMetadata {
 		cas_id,
 		fs_metadata,
 		kind,
-	} = FileMetadata::new(&location_path, &iso_file_path)
-		.await
-		.map_err(|e| FileIOError::from((location_path.join(&iso_file_path), e)))?;
+	} = FileMetadata::new(&location_path, &iso_file_path).await?;
 
-	if let Some(old_cas_id) = &file_path.cas_id {
-		if old_cas_id != &cas_id {
-			let (sync_params, db_params): (Vec<_>, Vec<_>) = {
-				use file_path::*;
+	let inode = if let Some(inode) = maybe_new_inode {
+		inode
+	} else {
+		#[cfg(target_family = "unix")]
+		{
+			get_inode(&fs_metadata)
+		}
 
-				[
-					(
-						(cas_id::NAME, json!(old_cas_id)),
-						cas_id::set(Some(old_cas_id.clone())),
-					),
-					(
-						(size_in_bytes::NAME, json!(fs_metadata.len().to_string())),
-						size_in_bytes::set(fs_metadata.len().to_string()),
-					),
-					{
-						let date = DateTime::<Local>::from(fs_metadata.modified_or_now()).into();
+		#[cfg(target_family = "windows")]
+		{
+			// FIXME: This is a workaround for Windows, because we can't get the inode from the metadata
+			get_inode_from_path(full_path).await?
+		}
+	};
 
-						((date_modified::NAME, json!(date)), date_modified::set(date))
-					},
-					{
-						// TODO: Should this be a skip rather than a null-set?
-						let checksum = if file_path.integrity_checksum.is_some() {
-							// If a checksum was already computed, we need to recompute it
-							Some(
-								file_checksum(full_path)
-									.await
-									.map_err(|e| FileIOError::from((full_path, e)))?,
-							)
-						} else {
-							None
-						};
-
-						(
-							(integrity_checksum::NAME, json!(checksum)),
-							integrity_checksum::set(checksum),
-						)
-					},
-				]
-				.into_iter()
-				.unzip()
-			};
-
-			// file content changed
-			sync.write_ops(
-				db,
-				(
-					sync_params
-						.into_iter()
-						.map(|(field, value)| {
-							sync.shared_update(
-								sync::file_path::SyncId {
-									pub_id: file_path.pub_id.clone(),
-								},
-								field,
-								value,
-							)
-						})
-						.collect(),
-					db.file_path().update(
-						file_path::pub_id::equals(file_path.pub_id.clone()),
-						db_params,
-					),
+	let is_hidden = path_is_hidden(full_path, &fs_metadata);
+	if file_path.cas_id.as_deref() != cas_id.as_ref().map(CasId::as_str) {
+		let (sync_params, db_params) = chain_optional_iter(
+			[
+				sync_db_entry!(
+					size_in_bytes_to_db(fs_metadata.len()),
+					file_path::size_in_bytes_bytes
 				),
-			)
-			.await?;
+				sync_db_entry!(
+					DateTime::<Utc>::from(fs_metadata.modified_or_now()),
+					file_path::date_modified
+				),
+			],
+			[
+				option_sync_db_entry!(file_path.cas_id.clone(), file_path::cas_id),
+				option_sync_db_entry!(
+					if file_path.integrity_checksum.is_some() {
+						// TODO: Should this be a skip rather than a null-set?
+						// If a checksum was already computed, we need to recompute it
+						Some(
+							file_checksum(full_path)
+								.await
+								.map_err(|e| FileIOError::from((full_path, e)))?,
+						)
+					} else {
+						None
+					},
+					file_path::integrity_checksum
+				),
+				option_sync_db_entry!(
+					(current_inode != inode).then(|| inode_to_db(inode)),
+					file_path::inode
+				),
+				option_sync_db_entry!(
+					(is_hidden != file_path.hidden.unwrap_or_default()).then_some(is_hidden),
+					file_path::hidden
+				),
+			],
+		)
+		.into_iter()
+		.unzip::<_, _, Vec<_>, Vec<_>>();
 
-			if let Some(ref object) = file_path.object {
-				// if this file had a thumbnail previously, we update it to match the new content
-				if library.thumbnail_exists(old_cas_id).await? && !file_path.extension.is_empty() {
-					generate_thumbnail(&file_path.extension, &cas_id, full_path, library).await;
+		// file content changed
+		sync.write_op(
+			db,
+			sync.shared_update(
+				prisma_sync::file_path::SyncId {
+					pub_id: file_path.pub_id.clone(),
+				},
+				sync_params,
+			),
+			db.file_path()
+				.update(
+					file_path::pub_id::equals(file_path.pub_id.clone()),
+					db_params,
+				)
+				.select(file_path::select!({ id })),
+		)
+		.await?;
 
-					// remove the old thumbnail as we're generating a new one
-					let thumb_path = get_thumbnail_path(library, old_cas_id);
-					fs::remove_file(&thumb_path)
-						.await
-						.map_err(|e| FileIOError::from((thumb_path, e)))?;
-				}
+		if let Some(ref object) = file_path.object {
+			let int_kind = kind as i32;
 
-				let int_kind = kind as i32;
-
-				if object.kind != int_kind {
+			if db
+				.file_path()
+				.count(vec![file_path::object_id::equals(Some(object.id))])
+				.exec()
+				.await? == 1
+			{
+				if object.kind.map(|k| k != int_kind).unwrap_or_default() {
+					let (sync_param, db_param) = sync_db_entry!(int_kind, object::kind);
 					sync.write_op(
 						db,
 						sync.shared_update(
-							sync::object::SyncId {
+							prisma_sync::object::SyncId {
 								pub_id: object.pub_id.clone(),
 							},
-							object::kind::NAME,
-							json!(int_kind),
+							[sync_param],
 						),
-						db.object().update(
-							object::id::equals(object.id),
-							vec![object::kind::set(int_kind)],
-						),
+						db.object()
+							.update(object::id::equals(object.id), vec![db_param])
+							.select(object::select!({ id })),
 					)
 					.await?;
 				}
+			} else {
+				let pub_id = ObjectPubId::new();
+				let date_created: DateTime<FixedOffset> =
+					DateTime::<Local>::from(fs_metadata.created_or_now()).into();
+
+				let device_pub_id = sync.device_pub_id.to_db();
+
+				let (sync_params, db_params) = [
+					sync_db_entry!(date_created, object::date_created),
+					sync_db_entry!(int_kind, object::kind),
+					(
+						sync_entry!(
+							prisma_sync::device::SyncId {
+								pub_id: device_pub_id.clone()
+							},
+							object::device
+						),
+						object::device::connect(device::pub_id::equals(device_pub_id)),
+					),
+				]
+				.into_iter()
+				.unzip::<_, _, Vec<_>, Vec<_>>();
+
+				sync.write_op(
+					db,
+					sync.shared_create(
+						prisma_sync::object::SyncId {
+							pub_id: pub_id.to_db(),
+						},
+						sync_params,
+					),
+					db.object().create(pub_id.to_db(), db_params),
+				)
+				.await?;
+
+				sync.write_op(
+					db,
+					sync.shared_update(
+						prisma_sync::location::SyncId {
+							pub_id: file_path.pub_id.clone(),
+						},
+						[sync_entry!(
+							prisma_sync::object::SyncId {
+								pub_id: pub_id.to_db()
+							},
+							file_path::object
+						)],
+					),
+					db.file_path()
+						.update(
+							file_path::pub_id::equals(file_path.pub_id.clone()),
+							vec![file_path::object::connect(object::pub_id::equals(
+								pub_id.into(),
+							))],
+						)
+						.select(file_path::select!({ id })),
+				)
+				.await?;
 			}
 
-			invalidate_query!(library, "search.paths");
+			if let Some(old_cas_id) = file_path.cas_id.as_ref().map(CasId::from) {
+				// if this file had a thumbnail previously, we update it to match the new content
+				if library.thumbnail_exists(node, &old_cas_id).await? {
+					if let Some(ext) = file_path.extension.clone() {
+						// Running in a detached task as thumbnail generation can take a while and we don't want to block the watcher
+						if let Some(cas_id) = cas_id {
+							let node = Arc::clone(node);
+							let path = full_path.to_path_buf();
+							let library_id = library.id;
+							let old_cas_id = old_cas_id.to_owned();
+
+							spawn(async move {
+								let thumbnails_directory =
+									get_thumbnails_directory(node.config.data_directory());
+
+								let was_overwritten = old_cas_id == cas_id;
+								if let Err(e) = generate_single_thumbnail(
+									&thumbnails_directory,
+									ext.clone(),
+									cas_id,
+									path,
+									ThumbnailKind::Indexed(library_id),
+								)
+								.await
+								{
+									error!(?e, "Failed to generate thumbnail in the watcher;");
+								}
+
+								// If only a few bytes changed, cas_id will probably remains intact
+								// so we overwrote our previous thumbnail, so we can't remove it
+								if !was_overwritten {
+									// remove the old thumbnail as we're generating a new one
+									let thumb_path = ThumbnailKind::Indexed(library_id)
+										.compute_path(node.config.data_directory(), &old_cas_id);
+									if let Err(e) = fs::remove_file(&thumb_path).await {
+										error!(
+											e = ?FileIOError::from((thumb_path, e)),
+											"Failed to remove old thumbnail;",
+										);
+									}
+								}
+							});
+						}
+					}
+				}
+			}
+
+			if let Some(extension) = &file_path.extension {
+				match kind {
+					ObjectKind::Image => {
+						if let Ok(image_extension) = ImageExtension::from_str(extension) {
+							if exif_media_data::can_extract(image_extension) {
+								if let Ok(Some(exif_data)) = exif_media_data::extract(full_path)
+									.await
+									.map_err(|e| error!(?e, "Failed to extract media data;"))
+								{
+									exif_media_data::save(
+										[(exif_data, object.id, object.pub_id.as_slice().into())],
+										db,
+										sync,
+									)
+									.await?;
+								}
+							}
+						}
+					}
+
+					ObjectKind::Audio => {
+						if let Ok(audio_extension) = AudioExtension::from_str(extension) {
+							if ffmpeg_media_data::can_extract_for_audio(audio_extension) {
+								if let Ok(ffmpeg_data) = ffmpeg_media_data::extract(full_path)
+									.await
+									.map_err(|e| error!(?e, "Failed to extract media data;"))
+								{
+									ffmpeg_media_data::save([(ffmpeg_data, object.id)], db).await?;
+								}
+							}
+						}
+					}
+
+					ObjectKind::Video => {
+						if let Ok(video_extension) = VideoExtension::from_str(extension) {
+							if ffmpeg_media_data::can_extract_for_video(video_extension) {
+								if let Ok(ffmpeg_data) = ffmpeg_media_data::extract(full_path)
+									.await
+									.map_err(|e| error!(?e, "Failed to extract media data;"))
+								{
+									ffmpeg_media_data::save([(ffmpeg_data, object.id)], db).await?;
+								}
+							}
+						}
+					}
+
+					_ => {
+						// Do nothing
+					}
+				}
+			}
 		}
+
+		invalidate_query!(library, "search.paths");
+		invalidate_query!(library, "search.objects");
+	} else if is_hidden != file_path.hidden.unwrap_or_default() {
+		let (sync_param, db_param) = sync_db_entry!(is_hidden, file_path::hidden);
+
+		sync.write_op(
+			db,
+			sync.shared_update(
+				prisma_sync::file_path::SyncId {
+					pub_id: file_path.pub_id.clone(),
+				},
+				[sync_param],
+			),
+			db.file_path()
+				.update(
+					file_path::pub_id::equals(file_path.pub_id.clone()),
+					vec![db_param],
+				)
+				.select(file_path::select!({ id })),
+		)
+		.await?;
+
+		invalidate_query!(library, "search.paths");
 	}
 
 	Ok(())
 }
 
+#[instrument(
+	skip_all,
+	fields(new_path = %new_path.as_ref().display(), old_path = %old_path.as_ref().display()),
+	err,
+)]
 pub(super) async fn rename(
-	location_id: LocationId,
-	new_path: impl AsRef<Path>,
-	old_path: impl AsRef<Path>,
+	location_id: location::id::Type,
+	new_path: impl AsRef<Path> + Send,
+	old_path: impl AsRef<Path> + Send,
+	new_path_metadata: Metadata,
 	library: &Library,
 ) -> Result<(), LocationManagerError> {
 	let location_path = extract_location_path(location_id, library).await?;
 	let old_path = old_path.as_ref();
 	let new_path = new_path.as_ref();
-	let Library { db, .. } = library;
+	let Library { db, sync, .. } = library;
 
 	let old_path_materialized_str =
 		extract_normalized_materialized_path_str(location_id, &location_path, old_path)?;
@@ -479,9 +890,10 @@ pub(super) async fn rename(
 	let new_path_materialized_str =
 		extract_normalized_materialized_path_str(location_id, &location_path, new_path)?;
 
-	// Renaming a file could potentially be a move to another directory, so we check if our parent changed
+	// Renaming a file could potentially be a move to another directory,
+	// so we check if our parent changed
 	if old_path_materialized_str != new_path_materialized_str
-		&& !check_existing_file_path(
+		&& !check_file_path_exists::<FilePathError>(
 			&IsolatedFilePathData::new(location_id, &location_path, new_path, true)?.parent(),
 			db,
 		)
@@ -489,213 +901,256 @@ pub(super) async fn rename(
 	{
 		return Err(LocationManagerError::MoveError {
 			path: new_path.into(),
-			reason: "parent directory does not exist".into(),
+			reason: "parent directory does not exist",
 		});
 	}
 
 	if let Some(file_path) = db
 		.file_path()
 		.find_first(loose_find_existing_file_path_params(
-			&IsolatedFilePathData::new(location_id, &location_path, old_path, true)?,
-		))
+			location_id,
+			&location_path,
+			old_path,
+		)?)
 		.exec()
 		.await?
 	{
-		let new =
-			IsolatedFilePathData::new(location_id, &location_path, new_path, file_path.is_dir)?;
+		let is_dir = maybe_missing(file_path.is_dir, "file_path.is_dir")?;
+
+		let new = IsolatedFilePathData::new(location_id, &location_path, new_path, is_dir)?;
+		let new_parts = new.to_parts();
 
 		// If the renamed path is a directory, we have to update every successor
-		if file_path.is_dir {
-			let old =
-				IsolatedFilePathData::new(location_id, &location_path, old_path, file_path.is_dir)?;
-			// TODO: Fetch all file_paths that will be updated and dispatch sync events
+		if is_dir {
+			let old = IsolatedFilePathData::new(location_id, &location_path, old_path, is_dir)?;
+			let old_parts = old.to_parts();
 
-			let updated = library
-				.db
-				._execute_raw(raw!(
-					"UPDATE file_path \
-						SET materialized_path = REPLACE(materialized_path, {}, {}) \
-						WHERE location_id = {}",
-					PrismaValue::String(format!("{}/{}/", old.materialized_path, old.name)),
-					PrismaValue::String(format!("{}/{}/", new.materialized_path, new.name)),
-					PrismaValue::Int(location_id as i64)
-				))
+			let starts_with = format!("{}/{}/", old_parts.materialized_path, old_parts.name);
+			let paths = db
+				.file_path()
+				.find_many(vec![
+					file_path::location_id::equals(Some(location_id)),
+					file_path::materialized_path::starts_with(starts_with.clone()),
+				])
+				.select(file_path::select!({
+					id
+					pub_id
+					materialized_path
+				}))
 				.exec()
 				.await?;
-			trace!("Updated {updated} file_paths");
+
+			let total_paths_count = paths.len();
+			let (sync_params, db_params) = paths
+				.into_iter()
+				.filter_map(|path| path.materialized_path.map(|mp| (path.id, path.pub_id, mp)))
+				.map(|(id, pub_id, mp)| {
+					let new_path = mp.replace(
+						&starts_with,
+						&format!("{}/{}/", new_parts.materialized_path, new_parts.name),
+					);
+
+					let (sync_param, db_param) =
+						sync_db_entry!(new_path, file_path::materialized_path);
+
+					(
+						sync.shared_update(
+							sd_prisma::prisma_sync::file_path::SyncId { pub_id },
+							[sync_param],
+						),
+						db.file_path()
+							.update(file_path::id::equals(id), vec![db_param])
+							.select(file_path::select!({ id })),
+					)
+				})
+				.unzip::<_, _, Vec<_>, Vec<_>>();
+
+			if !sync_params.is_empty() && !db_params.is_empty() {
+				sync.write_ops(db, (sync_params, db_params)).await?;
+			}
+
+			trace!(%total_paths_count, "Updated file_paths;");
 		}
 
-		library
-			.db
-			.file_path()
-			.update(
-				file_path::pub_id::equals(file_path.pub_id),
-				vec![
-					file_path::materialized_path::set(new_path_materialized_str),
-					file_path::name::set(new.name.to_string()),
-					file_path::extension::set(new.extension.to_string()),
-				],
-			)
-			.exec()
-			.await?;
+		let (sync_params, db_params) = [
+			sync_db_entry!(new_path_materialized_str, file_path::materialized_path),
+			sync_db_entry!(new_parts.name.to_string(), file_path::name),
+			sync_db_entry!(new_parts.extension.to_string(), file_path::extension),
+			sync_db_entry!(
+				DateTime::<Utc>::from(new_path_metadata.modified_or_now()),
+				file_path::date_modified
+			),
+			sync_db_entry!(
+				path_is_hidden(new_path, &new_path_metadata),
+				file_path::hidden
+			),
+		]
+		.into_iter()
+		.unzip::<_, _, Vec<_>, Vec<_>>();
+
+		sync.write_op(
+			db,
+			sync.shared_update(
+				prisma_sync::file_path::SyncId {
+					pub_id: file_path.pub_id.clone(),
+				},
+				sync_params,
+			),
+			db.file_path()
+				.update(file_path::pub_id::equals(file_path.pub_id), db_params)
+				.select(file_path::select!({ id })),
+		)
+		.await?;
 
 		invalidate_query!(library, "search.paths");
+		invalidate_query!(library, "search.objects");
 	}
 
 	Ok(())
 }
 
+#[instrument(skip_all, fields(path = %path.as_ref().display()), err)]
 pub(super) async fn remove(
-	location_id: LocationId,
-	full_path: impl AsRef<Path>,
+	location_id: location::id::Type,
+	path: impl AsRef<Path> + Send,
 	library: &Library,
 ) -> Result<(), LocationManagerError> {
-	let full_path = full_path.as_ref();
+	let full_path = path.as_ref();
 	let location_path = extract_location_path(location_id, library).await?;
 
 	// if it doesn't exist either way, then we don't care
-	let Some(file_path) = library.db
+	let Some(file_path) = library
+		.db
 		.file_path()
 		.find_first(loose_find_existing_file_path_params(
-			&IsolatedFilePathData::new(location_id, &location_path, full_path, true)?,
-		))
+			location_id,
+			&location_path,
+			full_path,
+		)?)
+		.select(file_path_watcher_remove::select())
 		.exec()
-		.await? else {
-			return Ok(());
+		.await?
+	else {
+		return Ok(());
 	};
 
-	remove_by_file_path(location_id, full_path, &file_path, library).await
+	remove_by_file_path(location_id, full_path, file_path, library).await
 }
 
-pub(super) async fn remove_by_file_path(
-	location_id: LocationId,
-	path: impl AsRef<Path>,
-	file_path: &file_path::Data,
+async fn remove_by_file_path(
+	location_id: location::id::Type,
+	path: impl AsRef<Path> + Send,
+	file_path: file_path_watcher_remove::Data,
 	library: &Library,
 ) -> Result<(), LocationManagerError> {
 	// check file still exists on disk
 	match fs::metadata(path.as_ref()).await {
 		Ok(_) => {
-			todo!("file has changed in some way, re-identify it")
+			// It's possible that in the interval of time between the removal file event being
+			// received and we reaching this point, the file has been created again for some
+			// external reason, so we just error out and hope to receive this new create event
+			// later
+			return Err(LocationManagerError::FileStillExistsOnDisk(
+				path.as_ref().into(),
+			));
 		}
 		Err(e) if e.kind() == ErrorKind::NotFound => {
-			let db = &library.db;
+			let Library { sync, db, .. } = library;
+
+			let is_dir = maybe_missing(file_path.is_dir, "file_path.is_dir")?;
 
 			// if is doesn't, we can remove it safely from our db
-			if file_path.is_dir {
+			if is_dir {
 				delete_directory(
 					library,
 					location_id,
-					Some(file_path.materialized_path.clone()),
+					Some(&IsolatedFilePathData::try_from(&file_path)?),
 				)
 				.await?;
 			} else {
-				db.file_path()
-					.delete(file_path::pub_id::equals(file_path.pub_id.clone()))
-					.exec()
-					.await?;
+				sync.write_op(
+					db,
+					sync.shared_delete(prisma_sync::file_path::SyncId {
+						pub_id: file_path.pub_id,
+					}),
+					db.file_path().delete(file_path::id::equals(file_path.id)),
+				)
+				.await?;
 
-				if let Some(object_id) = file_path.object_id {
-					db.object()
-						.delete_many(vec![
-							object::id::equals(object_id),
+				if let Some(object) = file_path.object {
+					// If this object doesn't have any other file paths, delete it
+					if db
+						.object()
+						.count(vec![
+							object::id::equals(object.id),
 							// https://www.prisma.io/docs/reference/api-reference/prisma-client-reference#none
 							object::file_paths::none(vec![]),
 						])
 						.exec()
+						.await? == 1
+					{
+						sync.write_op(
+							db,
+							sync.shared_delete(prisma_sync::object::SyncId {
+								pub_id: object.pub_id,
+							}),
+							db.object()
+								.delete(object::id::equals(object.id))
+								.select(object::select!({ id })),
+						)
 						.await?;
+					}
 				}
 			}
-
-			library.orphan_remover.invoke().await;
 		}
 		Err(e) => return Err(FileIOError::from((path, e)).into()),
 	}
 
 	invalidate_query!(library, "search.paths");
+	invalidate_query!(library, "search.objects");
 
 	Ok(())
 }
 
-async fn generate_thumbnail(
-	extension: &str,
-	cas_id: &str,
-	path: impl AsRef<Path>,
+#[instrument(skip_all, fields(path = %path.as_ref().display()), err)]
+pub(super) async fn extract_inode_from_path(
+	location_id: location::id::Type,
+	path: impl AsRef<Path> + Send,
 	library: &Library,
-) {
-	let path = path.as_ref();
-	let output_path = get_thumbnail_path(library, cas_id);
-
-	if let Err(e) = fs::metadata(&output_path).await {
-		if e.kind() != ErrorKind::NotFound {
-			error!(
-				"Failed to check if thumbnail exists, but we will try to generate it anyway: {e}"
-			);
-		}
-	// Otherwise we good, thumbnail doesn't exist so we can generate it
-	} else {
-		debug!(
-			"Skipping thumbnail generation for {} because it already exists",
-			path.display()
-		);
-		return;
-	}
-
-	if let Ok(extension) = ImageExtension::from_str(extension) {
-		if can_generate_thumbnail_for_image(&extension) {
-			if let Err(e) = generate_image_thumbnail(path, &output_path).await {
-				error!("Failed to image thumbnail on location manager: {e:#?}");
-			}
-		}
-	}
-
-	#[cfg(feature = "ffmpeg")]
-	{
-		use crate::object::preview::{can_generate_thumbnail_for_video, generate_video_thumbnail};
-		use sd_file_ext::extensions::VideoExtension;
-
-		if let Ok(extension) = VideoExtension::from_str(extension) {
-			if can_generate_thumbnail_for_video(&extension) {
-				if let Err(e) = generate_video_thumbnail(path, &output_path).await {
-					error!("Failed to video thumbnail on location manager: {e:#?}");
-				}
-			}
-		}
-	}
-}
-
-pub(super) async fn extract_inode_and_device_from_path(
-	location_id: LocationId,
-	path: impl AsRef<Path>,
-	library: &Library,
-) -> Result<INodeAndDevice, LocationManagerError> {
+) -> Result<INode, LocationManagerError> {
 	let path = path.as_ref();
 	let location = find_location(library, location_id)
 		.select(location::select!({ path }))
 		.exec()
 		.await?
-		.ok_or(LocationManagerError::MissingLocation(location_id))?;
+		.ok_or(LocationManagerError::LocationNotFound(location_id))?;
+
+	let location_path = maybe_missing(&location.path, "location.path")?;
 
 	library
 		.db
 		.file_path()
 		.find_first(loose_find_existing_file_path_params(
-			&IsolatedFilePathData::new(location_id, &location.path, path, true)?,
-		))
-		.select(file_path::select!( {inode device} ))
+			location_id,
+			location_path,
+			path,
+		)?)
+		.select(file_path::select!({ inode }))
 		.exec()
 		.await?
-		.map(|file_path| {
-			(
-				u64::from_le_bytes(file_path.inode[0..8].try_into().unwrap()),
-				u64::from_le_bytes(file_path.device[0..8].try_into().unwrap()),
-			)
-		})
-		.ok_or_else(|| FilePathError::NotFound(path.into()).into())
+		.map_or(
+			Err(FilePathError::NotFound(path.into()).into()),
+			|file_path| {
+				Ok(inode_from_db(
+					&maybe_missing(file_path.inode.as_ref(), "file_path.inode")?[0..8],
+				))
+			},
+		)
 }
 
+#[instrument(skip_all, err)]
 pub(super) async fn extract_location_path(
-	location_id: LocationId,
+	location_id: location::id::Type,
 	library: &Library,
 ) -> Result<PathBuf, LocationManagerError> {
 	find_location(library, location_id)
@@ -703,8 +1158,84 @@ pub(super) async fn extract_location_path(
 		.exec()
 		.await?
 		.map_or(
-			Err(LocationManagerError::MissingLocation(location_id)),
+			Err(LocationManagerError::LocationNotFound(location_id)),
 			// NOTE: The following usage of `PathBuf` doesn't incur a new allocation so it's fine
-			|location| Ok(PathBuf::from(location.path)),
+			|location| Ok(maybe_missing(location.path, "location.path")?.into()),
 		)
+}
+#[instrument(skip_all, err)]
+pub(super) async fn recalculate_directories_size(
+	candidates: &mut HashMap<PathBuf, Instant>,
+	buffer: &mut Vec<(PathBuf, Instant)>,
+	location_id: location::id::Type,
+	location_pub_id: location::pub_id::Type,
+	library: &Library,
+) -> Result<(), LocationManagerError> {
+	let mut location_path_cache = None;
+	let mut should_invalidate = false;
+	let mut should_update_location_size = false;
+	buffer.clear();
+
+	for (path, instant) in candidates.drain() {
+		if instant.elapsed() > HUNDRED_MILLIS * 5 {
+			if location_path_cache.is_none() {
+				location_path_cache = Some(PathBuf::from(maybe_missing(
+					find_location(library, location_id)
+						.select(location::select!({ path }))
+						.exec()
+						.await?
+						.ok_or(LocationManagerError::LocationNotFound(location_id))?
+						.path,
+					"location.path",
+				)?))
+			}
+
+			if let Some(location_path) = &location_path_cache {
+				if path != *location_path {
+					trace!(
+						start_directory = %path.display(),
+						end_directory = %location_path.display(),
+						"Reverse calculating directory sizes;",
+					);
+					let mut non_critical_errors = vec![];
+					reverse_update_directories_sizes(
+						path,
+						location_id,
+						location_path,
+						&library.db,
+						&library.sync,
+						&mut non_critical_errors,
+					)
+					.await
+					.map_err(sd_core_heavy_lifting::Error::from)?;
+
+					if !non_critical_errors.is_empty() {
+						error!(
+							?non_critical_errors,
+							"Reverse calculating directory sizes finished errors;",
+						);
+					}
+
+					should_invalidate = true;
+				} else {
+					should_update_location_size = true;
+				}
+			}
+		} else {
+			buffer.push((path, instant));
+		}
+	}
+
+	if should_update_location_size {
+		update_location_size(location_id, location_pub_id, library).await?;
+	}
+
+	if should_invalidate {
+		invalidate_query!(library, "search.paths");
+		invalidate_query!(library, "search.objects");
+	}
+
+	candidates.extend(buffer.drain(..));
+
+	Ok(())
 }

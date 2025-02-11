@@ -1,29 +1,35 @@
-import { Clipboard } from 'phosphor-react';
-import { Button, Dialog, Input, UseDialogProps, dialogManager, useDialog } from '@sd/ui';
-import { useZodForm, z } from '@sd/ui/src/forms';
+import { Clipboard } from '@phosphor-icons/react';
+import { ReactNode } from 'react';
+import { useZodForm } from '@sd/client';
+import { Button, Dialog, dialogManager, Input, useDialog, UseDialogProps } from '@sd/ui';
+import { useLocale } from '~/hooks';
 
 interface Props extends UseDialogProps {
 	title: string; // dialog title
 	description?: string; // description of the dialog
-	value: string; // value to be displayed as text or in an input box
+	children?: ReactNode; // dialog content
+	value?: string; // value to be displayed as text or in an input box
 	label?: string; // button label
 	inputBox?: boolean; // whether the dialog should display the `value` in a disabled input box or as text
+	cancelBtn?: boolean; // whether the dialog should have a cancel button
 }
 
 const AlertDialog = (props: Props) => {
-	const dialog = useDialog(props);
-	const form = useZodForm({ schema: z.object({}) });
+	const { t } = useLocale();
+
 	// maybe a copy-to-clipboard button would be beneficial too
 	return (
 		<Dialog
 			title={props.title}
-			form={form}
-			onSubmit={form.handleSubmit(() => {})}
-			dialog={dialog}
-			description={props.description}
-			ctaLabel={props.label !== undefined ? props.label : 'Done'}
+			form={useZodForm()}
+			dialog={useDialog(props)}
+			ctaLabel={props.label !== undefined ? props.label : t('done')}
+			cancelBtn={props.cancelBtn}
+			onCancelled={false}
 		>
-			{props.inputBox && (
+			{props.description && <div className="mb-3 text-sm">{props.description}</div>}
+			{props.children}
+			{props.inputBox ? (
 				<Input
 					value={props.value}
 					disabled
@@ -32,21 +38,21 @@ const AlertDialog = (props: Props) => {
 						<Button
 							type="button"
 							onClick={() => {
-								navigator.clipboard.writeText(props.value);
+								if (props.value) navigator.clipboard.writeText(props.value);
 							}}
 							size="icon"
 						>
-							<Clipboard className="h-4 w-4" />
+							<Clipboard className="size-4" />
 						</Button>
 					}
 				/>
+			) : (
+				<div className="text-sm">{props.value}</div>
 			)}
-
-			{!props.inputBox && <div className="text-sm">{props.value}</div>}
 		</Dialog>
 	);
 };
 
-export function showAlertDialog(props: Omit<Props, 'id'>) {
+export function showAlertDialog(props: Omit<Props & { children?: ReactNode }, 'id'>) {
 	dialogManager.create((dp) => <AlertDialog {...dp} {...props} />);
 }

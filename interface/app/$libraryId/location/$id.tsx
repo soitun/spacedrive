@@ -1,106 +1,246 @@
-import { useLibraryContext, useLibraryMutation, useRspcLibraryContext } from '@sd/client';
-import { dialogManager } from '@sd/ui';
-import { useInfiniteQuery } from '@tanstack/react-query';
-import { useEffect, useMemo } from 'react';
-import { useKey } from 'rooks';
-import { z } from 'zod';
-import { useZodRouteParams } from '~/hooks';
-import { getExplorerStore, useExplorerStore } from '~/hooks/useExplorerStore';
-import { useExplorerTopBarOptions } from '~/hooks/useExplorerTopBarOptions';
-import Explorer from '../Explorer';
-import DeleteDialog from '../Explorer/File/DeleteDialog';
-import { useExplorerSearchParams } from '../Explorer/util';
-import TopBarChildren from '../TopBar/TopBarChildren';
+import { ArrowClockwise, Info } from '@phosphor-icons/react';
+import { keepPreviousData } from '@tanstack/react-query';
+import { useCallback, useEffect, useMemo } from 'react';
+import { stringify } from 'uuid';
+import {
+	arraysEqual,
+	FilePathOrder,
+	filePathOrderingKeysSchema,
+	Location,
+	useLibraryQuery,
+	useLibrarySubscription,
+	useOnlineLocations
+} from '@sd/client';
+import { Loader, Tooltip } from '@sd/ui';
+import { LocationIdParamsSchema } from '~/app/route-schemas';
+import { Folder, Icon } from '~/components';
+import {
+	useIsLocationIndexing,
+	useKeyDeleteFile,
+	useLocale,
+	useRouteTitle,
+	useShortcut,
+	useZodRouteParams
+} from '~/hooks';
+import { useQuickRescan } from '~/hooks/useQuickRescan';
 
-const PARAMS = z.object({
-	id: z.coerce.number()
-});
+import Explorer from '../Explorer';
+import { ExplorerContextProvider } from '../Explorer/Context';
+import { createDefaultExplorerSettings, explorerStore } from '../Explorer/store';
+import { DefaultTopBarOptions } from '../Explorer/TopBarOptions';
+import { useExplorer, useExplorerSettings } from '../Explorer/useExplorer';
+import { useExplorerPreferences } from '../Explorer/useExplorerPreferences';
+import { useExplorerSearchParams } from '../Explorer/util';
+import { EmptyNotice } from '../Explorer/View/EmptyNotice';
+import { SearchContextProvider, SearchOptions, useSearchFromSearchParams } from '../search';
+import SearchBar from '../search/SearchBar';
+import { useSearchExplorerQuery } from '../search/useSearchExplorerQuery';
+import { TopBarPortal } from '../TopBar/Portal';
+import { TOP_BAR_ICON_DEFAULT_PROPS } from '../TopBar/TopBarOptions';
+import LocationOptions from './LocationOptions';
 
 export const Component = () => {
+	const { id: locationId } = useZodRouteParams(LocationIdParamsSchema);
 	const [{ path }] = useExplorerSearchParams();
-	const { id: location_id } = useZodRouteParams(PARAMS);
-	const { explorerViewOptions, explorerControlOptions, explorerToolOptions } = useExplorerTopBarOptions();
+	const result = useLibraryQuery(['locations.get', locationId], {
+		placeholderData: keepPreviousData,
+		suspense: true
+	});
+	const location = result.data;
 
-	// we destructure this since `mutate` is a stable reference but the object it's in is not
-	const { mutate: quickRescan } = useLibraryMutation('locations.quickRescan');
+	// 'key' allows search state to be thrown out when entering a folder
+	return <LocationExplorer key={path} location={location!} />;
+};
 
-	const explorerStore = getExplorerStore();
+const LocationExplorer = ({ location }: { location: Location; path?: string }) => {
+	const [{ path, take }] = useExplorerSearchParams();
 
-	useEffect(() => {
-		explorerStore.locationId = location_id;
-		if (location_id !== null) quickRescan({ location_id, sub_path: path ?? '' });
-	}, [explorerStore, location_id, path, quickRescan]);
+	const rescan = useQuickRescan();
 
-	const { query, items } = useItems();
+	const { explorerSettings, preferences } = useLocationExplorerSettings(location);
 
-	useKey('Delete', (e) => {
-		e.preventDefault();
+	const { layoutMode, mediaViewWithDescendants, showHiddenFiles } =
+		explorerSettings.useSettingsSnapshot();
 
-		const explorerStore = getExplorerStore();
+	const defaultFilters = useMemo(
+		() => [{ filePath: { locations: { in: [location.id] } } }],
+		[location.id]
+	);
 
-		if (explorerStore.selectedRowIndex === null) return;
+	const search = useSearchFromSearchParams({ defaultTarget: 'paths' });
 
-		const file = items?.[explorerStore.selectedRowIndex];
+	const searchFiltersAreDefault = useMemo(
+		() => JSON.stringify(defaultFilters) !== JSON.stringify(search.filters),
+		[defaultFilters, search.filters]
+	);
 
-		if (!file) return;
-
-		dialogManager.create((dp) => (
-			<DeleteDialog {...dp} location_id={location_id} path_id={file.item.id} />
-		));
+	const items = useSearchExplorerQuery({
+		search,
+		explorerSettings,
+		filters: [
+			...(search.allFilters.length > 0 ? search.allFilters : defaultFilters),
+			{
+				filePath: {
+					path: {
+						location_id: location.id,
+						path: path ?? '',
+						include_descendants:
+							search.search !== '' ||
+							(search.filters &&
+								search.filters.length > 0 &&
+								searchFiltersAreDefault) ||
+							(layoutMode === 'media' && mediaViewWithDescendants)
+					}
+				}
+			},
+			...(!showHiddenFiles ? [{ filePath: { hidden: false } }] : [])
+		],
+		take,
+		paths: { order: explorerSettings.useSettingsSnapshot().order },
+		onSuccess: () => explorerStore.resetCache()
 	});
 
+	const explorer = useExplorer({
+		...items,
+		isFetchingNextPage: items.query.isFetchingNextPage,
+		isFetching: items.query.isFetching,
+		isLoadingPreferences: preferences.isLoading,
+		settings: explorerSettings,
+		parent: { type: 'Location', location }
+	});
+
+	useLibrarySubscription(
+		['locations.quickRescan', { sub_path: path ?? '', location_id: location.id }],
+		{ onData() {} }
+	);
+
+	useEffect(() => {
+		// Using .call to silence eslint exhaustive deps warning.
+		// If clearSelectedItems referenced 'this' then this wouldn't work
+		explorer.resetSelectedItems.call(undefined);
+	}, [explorer.resetSelectedItems, path]);
+
+	useEffect(() => explorer.scrollRef.current?.scrollTo({ top: 0 }), [explorer.scrollRef, path]);
+
+	useKeyDeleteFile(explorer.selectedItems, location.id);
+
+	useShortcut('rescan', () => rescan(location.id));
+
+	const title = useRouteTitle(
+		(path && path?.length > 1 ? getLastSectionOfPath(path) : location.name) ?? ''
+	);
+
+	const isLocationIndexing = useIsLocationIndexing(location.id);
+
+	const { t } = useLocale();
+
 	return (
-		<>
-			<TopBarChildren toolOptions={[explorerViewOptions, explorerToolOptions, explorerControlOptions,]} />
-			<div className="relative flex w-full flex-col">
+		<ExplorerContextProvider explorer={explorer}>
+			<SearchContextProvider search={search}>
+				<TopBarPortal
+					center={<SearchBar defaultFilters={defaultFilters} />}
+					left={
+						<div className="flex items-center gap-2">
+							<Folder size={22} className="-mt-px" />
+							<span className="truncate text-sm font-medium">{title}</span>
+							<LocationOfflineInfo location={location} />
+							<LocationOptions location={location} path={path || ''} />
+						</div>
+					}
+					right={
+						<DefaultTopBarOptions
+							options={[
+								{
+									toolTipLabel: t('reload'),
+									onClick: () => rescan(location.id),
+									icon: <ArrowClockwise {...TOP_BAR_ICON_DEFAULT_PROPS} />,
+									individual: true,
+									showAtResolution: 'xl:flex'
+								}
+							]}
+						/>
+					}
+				>
+					{search.open && (
+						<>
+							<hr className="w-full border-t border-sidebar-divider bg-sidebar-divider" />
+							<SearchOptions />
+						</>
+					)}
+				</TopBarPortal>
+			</SearchContextProvider>
+			{isLocationIndexing ? (
+				<div className="flex size-full items-center justify-center">
+					<Loader />
+				</div>
+			) : !preferences.isLoading ? (
 				<Explorer
-					items={items}
-					onLoadMore={query.fetchNextPage}
-					hasNextPage={query.hasNextPage}
-					isFetchingNextPage={query.isFetchingNextPage}
+					emptyNotice={
+						<EmptyNotice
+							icon={<Icon name="FolderNoSpace" size={128} />}
+							message={t('location_empty_notice_message')}
+						/>
+					}
 				/>
-			</div>
-		</>
+			) : null}
+		</ExplorerContextProvider>
 	);
 };
 
+function LocationOfflineInfo({ location }: { location: Location }) {
+	const onlineLocations = useOnlineLocations();
 
+	const locationOnline = useMemo(
+		() => onlineLocations.some((l) => arraysEqual(location.pub_id, l)),
+		[location.pub_id, onlineLocations]
+	);
 
-const useItems = () => {
-	const { id: locationId } = useZodRouteParams(PARAMS);
-	const [{ path, take }] = useExplorerSearchParams();
+	const { t } = useLocale();
 
-	const ctx = useRspcLibraryContext();
-	const { library } = useLibraryContext();
+	return (
+		<>
+			{!locationOnline && (
+				<Tooltip label={t('location_disconnected_tooltip')}>
+					<Info className="text-ink-faint" />
+				</Tooltip>
+			)}
+		</>
+	);
+}
 
-	const explorerState = useExplorerStore();
+function getLastSectionOfPath(path: string): string | undefined {
+	if (path.endsWith('/')) {
+		path = path.slice(0, -1);
+	}
+	const sections = path.split('/');
+	const lastSection = sections[sections.length - 1];
+	return lastSection;
+}
 
-	const query = useInfiniteQuery({
-		queryKey: [
-			'search.paths',
-			{
-				library_id: library.uuid,
-				arg: {
-					locationId,
-					take,
-					...(explorerState.layoutMode === 'media'
-						? { kind: [5, 7] }
-						: { path: path ?? '' })
-				}
-			}
-		] as const,
-		queryFn: ({ pageParam: cursor, queryKey }) =>
-			ctx.client.query([
-				'search.paths',
-				{
-					...queryKey[1].arg,
-					cursor
-				}
-			]),
-		getNextPageParam: (lastPage) => lastPage.cursor ?? undefined
+function useLocationExplorerSettings(location: Location) {
+	const preferences = useExplorerPreferences({
+		data: location,
+		createDefaultSettings: useCallback(
+			() =>
+				createDefaultExplorerSettings<FilePathOrder>({
+					order: { field: 'name', value: 'Asc' }
+				}),
+			[]
+		),
+		getSettings: useCallback(
+			(prefs) => prefs.location?.[stringify(location.pub_id)]?.explorer,
+			[location.pub_id]
+		),
+		writeSettings: (settings) => ({
+			location: { [stringify(location.pub_id)]: { explorer: settings } }
+		})
 	});
 
-	const items = useMemo(() => query.data?.pages.flatMap((d) => d.items), [query.data]);
-
-	return { query, items };
-};
+	return {
+		explorerSettings: useExplorerSettings({
+			...preferences.explorerSettingsProps,
+			orderingKeys: filePathOrderingKeysSchema
+		}),
+		preferences
+	};
+}

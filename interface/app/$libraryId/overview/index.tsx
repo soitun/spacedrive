@@ -1,145 +1,138 @@
-import * as icons from '@sd/assets/icons';
-import {
-	ExplorerItem,
-	ObjectKind,
-	ObjectKindKey,
-	useLibraryContext,
-	useLibraryQuery,
-	useRspcLibraryContext
-} from '@sd/client';
-import { z } from '@sd/ui/src/forms';
-import { useInfiniteQuery } from '@tanstack/react-query';
-import { useMemo, useState } from 'react';
-import 'react-loading-skeleton/dist/skeleton.css';
-import { useExplorerStore, useExplorerTopBarOptions } from '~/hooks';
-import Explorer from '../Explorer';
-import { SEARCH_PARAMS } from '../Explorer/util';
-import { usePageLayout } from '../PageLayout';
-import TopBarChildren from '../TopBar/TopBarChildren';
-import CategoryButton from '../overview/CategoryButton';
-import Statistics from '../overview/Statistics';
+import { keepPreviousData } from '@tanstack/react-query';
+import { Key, useEffect } from 'react';
+import { Link } from 'react-router-dom';
+import { HardwareModel, useBridgeQuery, useLibraryQuery } from '@sd/client';
+import { useAccessToken, useLocale, useOperatingSystem } from '~/hooks';
+import { useRouteTitle } from '~/hooks/useRouteTitle';
+import { hardwareModelToIcon } from '~/util/hardware';
 
-// TODO: Replace left hand type with Category enum type (doesn't exist yet)
-const CategoryToIcon: Record<string, string> = {
-	Recents: 'Collection',
-	Favorites: 'HeartFlat',
-	Photos: 'Image',
-	Videos: 'Video',
-	Movies: 'Movie',
-	Music: 'Audio',
-	Documents: 'Document',
-	Downloads: 'Package',
-	Applications: 'Application',
-	Games: "Game",
-	Books: 'Book',
-	Encrypted: 'EncryptedLock',
-	Archives: 'Database',
-	Projects: 'Folder',
-	Trash: 'Trash'
-};
+import { SearchContextProvider, useSearchFromSearchParams } from '../search';
+import SearchBar from '../search/SearchBar';
+import { AddLocationButton } from '../settings/library/locations/AddLocationButton';
+import { TopBarPortal } from '../TopBar/Portal';
+import TopBarOptions from '../TopBar/TopBarOptions';
+import FileKindStatistics from './FileKindStats';
+import OverviewSection from './Layout/Section';
+import LibraryStatistics from './LibraryStats';
+import NewCard from './NewCard';
+import StatisticItem from './StatCard';
 
-// Map the category to the ObjectKind for searching
-const SearchableCategories: Record<string, ObjectKindKey> = {
-	Photos: 'Image',
-	Videos: 'Video',
-	Music: 'Audio',
-	Documents: 'Document',
-	Encrypted: 'Encrypted',
-	Books: 'Book',
+export interface FileKind {
+	kind: number;
+	name: string;
+	count: bigint;
+	total_bytes: bigint;
 }
 
-export type SearchArgs = z.infer<typeof SEARCH_PARAMS>;
-
 export const Component = () => {
-	const page = usePageLayout();
-	const explorerStore = useExplorerStore();
-	const ctx = useRspcLibraryContext();
-	const { library } = useLibraryContext();
-	const { explorerViewOptions, explorerControlOptions, explorerToolOptions } = useExplorerTopBarOptions();
+	useRouteTitle('Overview');
+	const os = useOperatingSystem();
 
-	const [selectedCategory, setSelectedCategory] = useState<string>('Recents');
+	const { t } = useLocale();
+	const accessToken = useAccessToken();
 
-	// TODO: integrate this into search query
-	const recentFiles = useLibraryQuery(['files.getRecent', 50]);
-	// this should be redundant once above todo is complete
-	const canSearch = !!SearchableCategories[selectedCategory] || selectedCategory === 'Favorites';
-
-	const kind = ObjectKind[SearchableCategories[selectedCategory] || 0] as number;
-
-	const categories = useLibraryQuery(['categories.list']);
-
-	// TODO: Make a custom double click handler for directories to take users to the location explorer.
-	// For now it's not needed because folders shouldn't show.
-	const query = useInfiniteQuery({
-		enabled: canSearch,
-		queryKey: [
-			'search.paths',
-			{
-				library_id: library.uuid,
-				arg: {
-					...(explorerStore.layoutMode === 'media'
-						? { kind: [5, 7].includes(kind) ? [kind] : [5, 7, kind] }
-						: { kind: [kind] })
-				}
-			}
-		] as const,
-		queryFn: ({ pageParam: cursor, queryKey }) =>
-			ctx.client.query([
-				'search.paths',
-				{
-					...queryKey[1].arg,
-					cursor,
-				},
-			]),
-		getNextPageParam: (lastPage) => lastPage.cursor ?? undefined
+	const locationsQuery = useLibraryQuery(['locations.list'], {
+		placeholderData: keepPreviousData
 	});
+	const locations = locationsQuery.data ?? [];
 
-	const searchItems = useMemo(() => query.data?.pages?.flatMap((d) => d.items), [query.data]);
+	// not sure if we'll need the node state in the future, as it should be returned with the cloud.devices.list query
+	// const { data: node } = useBridgeQuery(['nodeState']);
+	const cloudDevicesList = useBridgeQuery(['cloud.devices.list']);
 
-	let items: ExplorerItem[] = [];
-	switch (selectedCategory) {
-		case 'Recents':
-			items = recentFiles.data || [];
-			break;
-		default:
-			if (canSearch) {
-				items = searchItems || [];
-			}
-	}
+	useEffect(() => {
+		const interval = setInterval(async () => {
+			await cloudDevicesList.refetch();
+		}, 10000);
+		return () => clearInterval(interval);
+	}, []);
+	const { data: node } = useBridgeQuery(['nodeState']);
+	const stats = useLibraryQuery(['library.statistics']);
+	console.log('stats', stats.data);
+
+	const search = useSearchFromSearchParams({ defaultTarget: 'paths' });
 
 	return (
-		<>
-			<TopBarChildren toolOptions={[explorerViewOptions, explorerToolOptions, explorerControlOptions]} />
-			<Explorer
-				inspectorClassName="!pt-0 !fixed !top-[50px] !right-[10px] !w-[260px]"
-				viewClassName="!pl-0 !pt-0 !h-auto"
-				explorerClassName="!overflow-visible"
-				items={items}
-				onLoadMore={query.fetchNextPage}
-				hasNextPage={query.hasNextPage}
-				isFetchingNextPage={query.isFetchingNextPage}
-				scrollRef={page?.ref}
-			>
-				<Statistics />
-				<div className="no-scrollbar sticky top-0 z-50 mt-4 flex space-x-[1px] overflow-x-scroll bg-app/90 py-1.5 backdrop-blur">
-					{categories.data?.map((category) => {
-						const iconString = CategoryToIcon[category.name] || 'Document';
-						const icon = icons[iconString as keyof typeof icons];
-						return (
-							<CategoryButton
-								key={category.name}
-								category={category.name}
-								icon={icon}
-								items={category.count}
-								selected={selectedCategory === category.name}
-								onClick={() => setSelectedCategory(category.name)}
+		<SearchContextProvider search={search}>
+			<div>
+				<TopBarPortal
+					left={
+						<div className="flex items-center gap-2">
+							<span className="truncate text-sm font-medium">{t('library_overview')}</span>
+						</div>
+					}
+					center={<SearchBar redirectToSearch />}
+					right={os === 'windows' && <TopBarOptions />}
+				/>
+				<div className="mt-4 flex flex-col gap-3 pt-3">
+					<OverviewSection>
+						<LibraryStatistics />
+						<FileKindStatistics />
+					</OverviewSection>
+
+					<OverviewSection
+						count={(cloudDevicesList.data?.length ?? 0) + (node ? 1 : 0)}
+						title={t('devices')}
+					>
+						{node && (
+							<StatisticItem
+								name={node.name}
+								icon={hardwareModelToIcon(node.device_model as any)}
+								totalSpace={stats.data?.statistics?.total_local_bytes_capacity || '0'}
+								freeSpace={stats.data?.statistics?.total_local_bytes_free || '0'}
+								color="#0362FF"
+								connectionType={null}
 							/>
-						);
-					})}
+						)}
+						{cloudDevicesList.data?.map((device) => (
+							<StatisticItem
+								key={device.pub_id}
+								name={device.name}
+								icon={hardwareModelToIcon(device.hardware_model as HardwareModel)}
+								totalSpace="0"
+								freeSpace="0"
+								color="#0362FF"
+								connectionType={'cloud'}
+							/>
+						))}
+					</OverviewSection>
+
+					<OverviewSection count={locations.length} title={t('locations')}>
+						{locations?.map((item) => (
+							<Link key={item.id} to={`../location/${item.id}`}>
+								<StatisticItem
+									name={item.name || t('unnamed_location')}
+									icon="Folder"
+									totalSpace={item.size_in_bytes || [0]}
+									color="#0362FF"
+									connectionType={null}
+								/>
+							</Link>
+						))}
+						{!locations?.length && (
+							<NewCard
+								icons={['HDD', 'Folder', 'Globe', 'SD']}
+								text={t('add_location_overview_description')}
+								button={() => <AddLocationButton variant="outline" />}
+							/>
+						)}
+					</OverviewSection>
+
+					<OverviewSection count={0} title={t('cloud_drives')}>
+						<NewCard
+							icons={[
+								'DriveAmazonS3',
+								'DriveDropbox',
+								'DriveGoogleDrive',
+								'DriveOneDrive'
+								// 'DriveBox'
+							]}
+							text={t('connect_cloud_description')}
+							// buttonText={t('connect_cloud)}
+						/>
+					</OverviewSection>
 				</div>
-			</Explorer>
-		</>
+			</div>
+		</SearchContextProvider>
 	);
 };
-
-

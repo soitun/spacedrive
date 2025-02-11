@@ -1,8 +1,9 @@
-import { ProcedureDef, inferProcedureResult, inferSubscriptionResult } from '@rspc/client';
-import { AlphaRSPCError, initRspc } from '@rspc/client/v2';
-import { Context, createReactQueryHooks } from '@rspc/react/v2';
+import { initRspc, ProcedureDef, RSPCError } from '@spacedrive/rspc-client';
+import { Context, createReactQueryHooks } from '@spacedrive/rspc-react/src/v2';
 import { QueryClient } from '@tanstack/react-query';
-import { PropsWithChildren, createContext, useContext } from 'react';
+import { createContext, PropsWithChildren, useContext } from 'react';
+import { match, P } from 'ts-pattern';
+
 import { LibraryArgs, Procedures } from './core';
 import { currentLibraryCache } from './hooks';
 
@@ -24,11 +25,11 @@ type StripLibraryArgsFromInput<
 				key: T['key'];
 				input: NeverOverNull extends true ? (E extends null ? never : E) : E;
 				result: T['result'];
-		  }
+			}
 		: never
 	: never;
 
-type NonLibraryProceduresDef = {
+export type NonLibraryProceduresDef = {
 	queries: NonLibraryProcedure<'queries'>;
 	mutations: NonLibraryProcedure<'mutations'>;
 	subscriptions: NonLibraryProcedure<'subscriptions'>;
@@ -40,9 +41,11 @@ export type LibraryProceduresDef = {
 	subscriptions: StripLibraryArgsFromInput<LibraryProcedures<'subscriptions'>, true>;
 };
 
-const context = createContext<Context<LibraryProceduresDef>>(undefined!);
+export const context = createContext<Context<NonLibraryProceduresDef>>(undefined!);
+export const context2 = createContext<Context<LibraryProceduresDef>>(undefined!);
 
-export const useRspcLibraryContext = () => useContext(context);
+export const useRspcContext = () => useContext(context);
+export const useRspcLibraryContext = () => useContext(context2);
 
 export const rspc = initRspc<Procedures>({
 	links: globalThis.rspcLinks
@@ -51,13 +54,13 @@ export const rspc2 = initRspc<Procedures>({
 	links: globalThis.rspcLinks
 }); // TODO: Removing this?
 
-const nonLibraryClient = rspc.dangerouslyHookIntoInternals<NonLibraryProceduresDef>();
-// @ts-expect-error // TODO: Fix
+export const nonLibraryClient = rspc.dangerouslyHookIntoInternals<NonLibraryProceduresDef>();
+
 const nonLibraryHooks = createReactQueryHooks<NonLibraryProceduresDef>(nonLibraryClient, {
-	// context // TODO: Shared context
+	context // TODO: Shared context
 });
 
-const libraryClient = rspc2.dangerouslyHookIntoInternals<LibraryProceduresDef>({
+export const libraryClient = rspc2.dangerouslyHookIntoInternals<LibraryProceduresDef>({
 	mapQueryKey: (keyAndInput) => {
 		const libraryId = currentLibraryCache.id;
 		if (libraryId === null)
@@ -65,9 +68,9 @@ const libraryClient = rspc2.dangerouslyHookIntoInternals<LibraryProceduresDef>({
 		return [keyAndInput[0], { library_id: libraryId, arg: keyAndInput[1] ?? null }];
 	}
 });
-// @ts-expect-error // TODO: idk
+
 const libraryHooks = createReactQueryHooks<LibraryProceduresDef>(libraryClient, {
-	context
+	context: context2
 });
 
 // TODO: Allow both hooks to use a unified context -> Right now they override each others local state
@@ -96,16 +99,23 @@ export function useInvalidateQuery() {
 	useBridgeSubscription(['invalidation.listen'], {
 		onData: (ops) => {
 			for (const op of ops) {
-				let key = [op.key];
-				if (op.arg !== null) {
-					key = key.concat(op.arg);
-				}
+				match(op)
+					.with({ type: 'single', data: P.select() }, (op) => {
+						let key: unknown[] = [op.key];
+						if (op.arg !== null) {
+							key = key.concat(op.arg);
+						}
 
-				if (op.result !== null) {
-					context.queryClient.setQueryData(key, op.result);
-				} else {
-					context.queryClient.invalidateQueries(key);
-				}
+						if (op.result !== null) {
+							context.queryClient.setQueryData(key, op.result);
+						} else {
+							context.queryClient.invalidateQueries({ queryKey: key });
+						}
+					})
+					.with({ type: 'all' }, (op) => {
+						context.queryClient.invalidateQueries();
+					})
+					.exhaustive();
 			}
 		}
 	});
@@ -113,6 +123,6 @@ export function useInvalidateQuery() {
 
 // TODO: Remove/fix this when rspc typesafe errors are working
 export function extractInfoRSPCError(error: unknown) {
-	if (!(error instanceof AlphaRSPCError)) return null;
+	if (!(error instanceof RSPCError)) return null;
 	return error;
 }

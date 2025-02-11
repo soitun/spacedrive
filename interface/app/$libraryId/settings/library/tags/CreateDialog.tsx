@@ -1,56 +1,100 @@
-import { useLibraryMutation, usePlausibleEvent } from '@sd/client';
-import { Dialog, UseDialogProps, useDialog } from '@sd/ui';
-import { Input, useZodForm, z } from '@sd/ui/src/forms';
-import ColorPicker from '~/components/ColorPicker';
+import {
+	FilePath,
+	Object,
+	Target,
+	ToastDefautlColor,
+	useLibraryMutation,
+	usePlausibleEvent,
+	useRspcLibraryContext,
+	useZodForm
+} from '@sd/client';
+import { Dialog, InputField, useDialog, UseDialogProps, z } from '@sd/ui';
+import { ColorPicker } from '~/components';
+import { useLocale } from '~/hooks';
 
-export default (props: UseDialogProps & { assignToObject?: number }) => {
-	const dialog = useDialog(props);
+const schema = z.object({
+	name: z.string().trim().min(1).max(24),
+	color: z.string()
+});
+
+export type AssignTagItems = Array<
+	{ type: 'Object'; item: Object } | { type: 'Path'; item: FilePath }
+>;
+
+export function useAssignItemsToTag() {
 	const submitPlausibleEvent = usePlausibleEvent();
+	const rspc = useRspcLibraryContext();
 
-	const form = useZodForm({
-		schema: z.object({
-			name: z.string(),
-			color: z.string()
-		}),
-		defaultValues: {
-			color: '#A717D9'
+	const mutation = useLibraryMutation(['tags.assign'], {
+		onSuccess: () => {
+			submitPlausibleEvent({ event: { type: 'tagAssign' } });
+			rspc.queryClient.invalidateQueries({ queryKey: ['search.paths'] });
 		}
 	});
 
-	const createTag = useLibraryMutation('tags.create', {
-		onSuccess: (tag) => {
-			submitPlausibleEvent({ event: { type: 'tagCreate' } });
-			if (props.assignToObject !== undefined) {
-				assignTag.mutate({
-					tag_id: tag.id,
-					object_id: props.assignToObject,
-					unassign: false
-				});
+	return (tagId: number, items: AssignTagItems, unassign: boolean = false) => {
+		const targets = items.map<Target>((item) => {
+			if (item.type === 'Object') {
+				return { Object: item.item.id };
+			} else {
+				return { FilePath: item.item.id };
 			}
-		},
-		onError: (e) => {
+		});
+
+		return mutation.mutateAsync({
+			tag_id: tagId,
+			targets,
+			unassign
+		});
+	};
+}
+
+export default (
+	props: UseDialogProps & {
+		items?: AssignTagItems;
+	}
+) => {
+	const submitPlausibleEvent = usePlausibleEvent();
+
+	const form = useZodForm({
+		schema: schema,
+		defaultValues: { color: ToastDefautlColor }
+	});
+
+	const createTag = useLibraryMutation('tags.create');
+
+	const assignItemsToTag = useAssignItemsToTag();
+
+	const onSubmit = form.handleSubmit(async (data) => {
+		try {
+			const tag = await createTag.mutateAsync(data);
+
+			submitPlausibleEvent({ event: { type: 'tagCreate' } });
+
+			if (props.items !== undefined) await assignItemsToTag(tag.id, props.items, false);
+		} catch (e) {
 			console.error('error', e);
 		}
 	});
 
-	const assignTag = useLibraryMutation('tags.assign', {
-		onSuccess: () => {
-			submitPlausibleEvent({ event: { type: 'tagAssign' } });
-		}
-	});
+	const { t } = useLocale();
 
 	return (
 		<Dialog
-			{...{ dialog, form }}
-			onSubmit={form.handleSubmit((data) => createTag.mutateAsync(data))}
-			title="Create New Tag"
-			description="Choose a name and color."
-			ctaLabel="Create"
+			invertButtonFocus
+			form={form}
+			onSubmit={onSubmit}
+			dialog={useDialog(props)}
+			title={t('create_new_tag')}
+			description={t('create_new_tag_description')}
+			ctaLabel={t('create')}
+			closeLabel={t('close')}
 		>
-			<div className="relative mt-3 ">
-				<Input
+			<div className="relative mt-3">
+				<InputField
 					{...form.register('name', { required: true })}
-					placeholder="Name"
+					placeholder={t('name')}
+					maxLength={24}
 					icon={<ColorPicker control={form.control} name="color" />}
 				/>
 			</div>

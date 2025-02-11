@@ -1,58 +1,82 @@
-use crate::{
-	invalidate_query,
-	job::{Job, JobManagerError},
-	library::Library,
-	object::{
-		file_identifier::{
-			file_identifier_job::FileIdentifierJobInit,
-			shallow_file_identifier_job::ShallowFileIdentifierJobInit,
-		},
-		preview::{
-			shallow_thumbnailer_job::ShallowThumbnailerJobInit, thumbnailer_job::ThumbnailerJobInit,
-		},
-	},
-	prisma::{file_path, indexer_rules_in_location, location, node, object, PrismaClient},
-	sync,
-	util::{db::uuid_to_bytes, error::FileIOError},
+use crate::{context::NodeContext, invalidate_query, library::Library, Node};
+
+use sd_core_file_path_helper::{
+	filter_existing_file_path_params, IsolatedFilePathData, IsolatedFilePathDataParts,
+};
+use sd_core_heavy_lifting::{
+	file_identifier::{self, FileIdentifier},
+	indexer::{self, job::Indexer},
+	job_system::report::ReportInputMetadata,
+	media_processor::{self, job::MediaProcessor},
+	JobEnqueuer, JobId,
+};
+use sd_core_prisma_helpers::{location_with_indexer_rules, CasId};
+
+use sd_prisma::{
+	prisma::{device, file_path, indexer_rules_in_location, instance, location, PrismaClient},
+	prisma_sync,
+};
+use sd_sync::*;
+use sd_utils::{
+	db::{maybe_missing, size_in_bytes_from_db, size_in_bytes_to_db},
+	error::{FileIOError, NonUtf8PathError},
+	uuid_to_bytes,
 };
 
 use std::{
 	collections::HashSet,
 	path::{Component, Path, PathBuf},
+	sync::Arc,
 };
 
+use chrono::Utc;
 use futures::future::TryFutureExt;
 use normpath::PathExt;
-use prisma_client_rust::QueryError;
-use serde::Deserialize;
-use serde_json::json;
+use prisma_client_rust::{operator::and, or, QueryError};
+use serde::{Deserialize, Serialize};
 use specta::Type;
-use tokio::{fs, io};
-use tracing::{debug, info};
+use tokio::{fs, io, time::Instant};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 mod error;
-pub mod file_path_helper;
-pub mod indexer;
 mod manager;
-mod metadata;
+pub mod metadata;
+pub mod non_indexed;
 
 pub use error::LocationError;
-use indexer::{shallow_indexer_job::ShallowIndexerJobInit, IndexerJobInit};
-pub use manager::{LocationManager, LocationManagerError};
+pub use manager::{LocationManagerError, Locations};
 use metadata::SpacedriveLocationMetadataFile;
 
-pub type LocationId = i32;
+pub type LocationPubId = Uuid;
 
-// Location includes!
-location::include!(location_with_indexer_rules {
-	indexer_rules: select { indexer_rule }
-});
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Eq, PartialEq)]
+pub enum ScanState {
+	Pending = 0,
+	Indexed = 1,
+	FilesIdentified = 2,
+	Completed = 3,
+}
+
+impl TryFrom<i32> for ScanState {
+	type Error = LocationError;
+
+	fn try_from(value: i32) -> Result<Self, Self::Error> {
+		Ok(match value {
+			0 => Self::Pending,
+			1 => Self::Indexed,
+			2 => Self::FilesIdentified,
+			3 => Self::Completed,
+			_ => return Err(LocationError::InvalidScanStateValue(value)),
+		})
+	}
+}
 
 /// `LocationCreateArgs` is the argument received from the client using `rspc` to create a new location.
 /// It has the actual path and a vector of indexer rules ids, to create many-to-many relationships
 /// between the location and indexer rules.
-#[derive(Type, Deserialize)]
+#[derive(Debug, Type, Deserialize)]
 pub struct LocationCreateArgs {
 	pub path: PathBuf,
 	pub dry_run: bool,
@@ -60,14 +84,22 @@ pub struct LocationCreateArgs {
 }
 
 impl LocationCreateArgs {
+	#[instrument(skip(node, library), err)]
 	pub async fn create(
 		self,
-		library: &Library,
+		node: &Node,
+		library: &Arc<Library>,
 	) -> Result<Option<location_with_indexer_rules::Data>, LocationError> {
+		let Some(path_str) = self.path.to_str().map(str::to_string) else {
+			return Err(LocationError::NonUtf8Path(NonUtf8PathError(
+				self.path.into_boxed_path(),
+			)));
+		};
+
 		let path_metadata = match fs::metadata(&self.path).await {
 			Ok(metadata) => metadata,
 			Err(e) if e.kind() == io::ErrorKind::NotFound => {
-				return Err(LocationError::PathNotFound(self.path))
+				return Err(LocationError::PathNotFound(self.path.into_boxed_path()))
 			}
 			Err(e) => {
 				return Err(LocationError::LocationPathFilesystemMetadataAccess(
@@ -77,35 +109,61 @@ impl LocationCreateArgs {
 		};
 
 		if !path_metadata.is_dir() {
-			return Err(LocationError::NotDirectory(self.path));
+			return Err(LocationError::NotDirectory(self.path.into_boxed_path()));
 		}
 
-		if let Some(metadata) = SpacedriveLocationMetadataFile::try_load(&self.path).await? {
-			return if let Some(old_path) = metadata.location_path(library.id) {
-				if old_path == self.path {
-					Err(LocationError::LocationAlreadyExists(self.path))
+		if let Some(mut metadata) = SpacedriveLocationMetadataFile::try_load(&self.path).await? {
+			metadata
+				.clean_stale_libraries(
+					&node
+						.libraries
+						.get_all()
+						.await
+						.into_iter()
+						.map(|library| library.id)
+						.collect(),
+				)
+				.await?;
+
+			if !metadata.is_empty() {
+				if let Some(old_path) = metadata.location_path(library.id) {
+					if old_path == self.path {
+						if library
+							.db
+							.location()
+							.count(vec![location::path::equals(Some(path_str))])
+							.exec()
+							.await? > 0
+						{
+							// Location already exists in this library
+							return Err(LocationError::LocationAlreadyExists(
+								self.path.into_boxed_path(),
+							));
+						}
+					} else {
+						return Err(LocationError::NeedRelink {
+							old_path: old_path.into(),
+							new_path: self.path.into_boxed_path(),
+						});
+					}
 				} else {
-					Err(LocationError::NeedRelink {
-						old_path: old_path.to_path_buf(),
-						new_path: self.path,
-					})
-				}
-			} else {
-				Err(LocationError::AddLibraryToMetadata(self.path))
-			};
+					return Err(LocationError::AddLibraryToMetadata(
+						self.path.into_boxed_path(),
+					));
+				};
+			}
 		}
 
 		debug!(
-			"{} new location for '{}'",
+			"{} new location",
 			if self.dry_run {
 				"Dry run: Would create"
 			} else {
 				"Trying to create"
-			},
-			self.path.display()
+			}
 		);
 
-		let uuid = Uuid::new_v4();
+		let uuid = Uuid::now_v7();
 
 		let location = create_location(
 			library,
@@ -117,62 +175,78 @@ impl LocationCreateArgs {
 		.await?;
 
 		if let Some(location) = location {
+			info!(location_name = ?location.name, "Created location;");
+
 			// Write location metadata to a .spacedrive file
-			if let Err(err) = SpacedriveLocationMetadataFile::create_and_save(
+			if let Err(e) = SpacedriveLocationMetadataFile::create_and_save(
 				library.id,
 				uuid,
 				&self.path,
-				location.name.clone(),
+				location.name,
 			)
 			.err_into::<LocationError>()
 			.and_then(|()| async move {
-				Ok(library
-					.location_manager()
-					.add(location.id, library.clone())
-					.await?)
+				node.locations
+					.add(location.data.id, library.clone())
+					.await
+					.map_err(Into::into)
 			})
 			.await
 			{
-				delete_location(library, location.id).await?;
-				Err(err)?;
+				// DISABLED TO FAIL SILENTLY - HOTFIX FOR LACK OF WRITE PERMISSION PREVENTING LOCATION CREATION
+				error!(?e, "Failed to write .spacedrive file;");
+				// delete_location(node, library, location.data.id).await?;
+				// Err(e)?;
 			}
 
-			info!("Created location: {location:?}");
-
-			Ok(Some(location))
+			Ok(Some(location.data))
 		} else {
 			Ok(None)
 		}
 	}
 
+	#[instrument(skip(node, library), fields(library_id = %library.id), err)]
 	pub async fn add_library(
 		self,
-		library: &Library,
+		node: &Node,
+		library: &Arc<Library>,
 	) -> Result<Option<location_with_indexer_rules::Data>, LocationError> {
-		let mut metadata = SpacedriveLocationMetadataFile::try_load(&self.path)
-			.await?
-			.ok_or_else(|| LocationError::MetadataNotFound(self.path.clone()))?;
+		let Some(mut metadata) = SpacedriveLocationMetadataFile::try_load(&self.path).await? else {
+			return Err(LocationError::MetadataNotFound(self.path.into_boxed_path()));
+		};
+
+		metadata
+			.clean_stale_libraries(
+				&node
+					.libraries
+					.get_all()
+					.await
+					.into_iter()
+					.map(|library| library.id)
+					.collect(),
+			)
+			.await?;
 
 		if metadata.has_library(library.id) {
 			return Err(LocationError::NeedRelink {
-				// SAFETY: This unwrap is ok as we checked that we have this library_id
-				old_path: metadata.location_path(library.id).unwrap().to_path_buf(),
-				new_path: self.path,
+				old_path: metadata
+					.location_path(library.id)
+					.expect("We checked that we have this library_id")
+					.into(),
+				new_path: self.path.into_boxed_path(),
 			});
 		}
 
 		debug!(
-			"{} a new library (library_id = {}) to an already existing location '{}'",
+			"{} a new Library to an already existing location",
 			if self.dry_run {
 				"Dry run: Would add"
 			} else {
 				"Trying to add"
 			},
-			library.id,
-			self.path.display()
 		);
 
-		let uuid = Uuid::new_v4();
+		let uuid = Uuid::now_v7();
 
 		let location = create_location(
 			library,
@@ -185,20 +259,16 @@ impl LocationCreateArgs {
 
 		if let Some(location) = location {
 			metadata
-				.add_library(library.id, uuid, &self.path, location.name.clone())
+				.add_library(library.id, uuid, &self.path, location.name)
 				.await?;
 
-			library
-				.location_manager()
-				.add(location.id, library.clone())
+			node.locations
+				.add(location.data.id, library.clone())
 				.await?;
 
-			info!(
-				"Added library (library_id = {}) to location: {location:?}",
-				library.id
-			);
+			info!(location_id = %location.data.id, "Added library to location;");
 
-			Ok(Some(location))
+			Ok(Some(location.data))
 		} else {
 			Ok(None)
 		}
@@ -213,17 +283,18 @@ impl LocationCreateArgs {
 /// Old rules that aren't in this vector will be purged.
 #[derive(Type, Deserialize)]
 pub struct LocationUpdateArgs {
-	pub id: i32,
-	pub name: Option<String>,
-	pub generate_preview_media: Option<bool>,
-	pub sync_preview_media: Option<bool>,
-	pub hidden: Option<bool>,
-	pub indexer_rules_ids: Vec<i32>,
+	id: location::id::Type,
+	name: Option<String>,
+	generate_preview_media: Option<bool>,
+	sync_preview_media: Option<bool>,
+	hidden: Option<bool>,
+	indexer_rules_ids: Vec<i32>,
+	path: Option<String>,
 }
 
 impl LocationUpdateArgs {
-	pub async fn update(self, library: &Library) -> Result<(), LocationError> {
-		let Library { sync, db, .. } = &library;
+	pub async fn update(self, node: &Node, library: &Arc<Library>) -> Result<(), LocationError> {
+		let Library { sync, db, .. } = &**library;
 
 		let location = find_location(library, self.id)
 			.include(location_with_indexer_rules::include())
@@ -231,58 +302,57 @@ impl LocationUpdateArgs {
 			.await?
 			.ok_or(LocationError::IdNotFound(self.id))?;
 
-		let (sync_params, db_params): (Vec<_>, Vec<_>) = [
-			self.name
-				.clone()
-				.filter(|name| &location.name != name)
-				.map(|v| ((location::name::NAME, json!(v)), location::name::set(v))),
-			self.generate_preview_media.map(|v| {
-				(
-					(location::generate_preview_media::NAME, json!(v)),
-					location::generate_preview_media::set(v),
-				)
-			}),
-			self.sync_preview_media.map(|v| {
-				(
-					(location::sync_preview_media::NAME, json!(v)),
-					location::sync_preview_media::set(v),
-				)
-			}),
-			self.hidden
-				.map(|v| ((location::hidden::NAME, json!(v)), location::hidden::set(v))),
+		let name = self.name.clone();
+
+		let (sync_params, db_params) = [
+			option_sync_db_entry!(
+				self.name
+					.filter(|name| location.name.as_ref() != Some(name)),
+				location::name
+			),
+			option_sync_db_entry!(
+				self.generate_preview_media,
+				location::generate_preview_media
+			),
+			option_sync_db_entry!(self.sync_preview_media, location::sync_preview_media),
+			option_sync_db_entry!(self.hidden, location::hidden),
+			option_sync_db_entry!(self.path.clone(), location::path),
 		]
 		.into_iter()
 		.flatten()
-		.unzip();
+		.unzip::<_, _, Vec<_>, Vec<_>>();
 
 		if !sync_params.is_empty() {
-			sync.write_ops(
+			sync.write_op(
 				db,
-				(
-					sync_params
-						.into_iter()
-						.map(|p| {
-							sync.shared_update(
-								sync::location::SyncId {
-									pub_id: location.pub_id.clone(),
-								},
-								p.0,
-								p.1,
-							)
-						})
-						.collect(),
-					db.location()
-						.update(location::id::equals(self.id), db_params),
+				sync.shared_update(
+					prisma_sync::location::SyncId {
+						pub_id: location.pub_id.clone(),
+					},
+					sync_params,
 				),
+				db.location()
+					.update(location::id::equals(self.id), db_params)
+					.select(location::select!({ id })),
 			)
 			.await?;
 
-			if location.node_id == library.node_local_id {
-				if let Some(mut metadata) =
-					SpacedriveLocationMetadataFile::try_load(&location.path).await?
-				{
-					metadata.update(library.id, self.name.unwrap()).await?;
+			// TODO(N): This will probs fall apart with removable media.
+			if location.instance_id == Some(library.config().await.instance_id) {
+				if let Some(path) = &location.path {
+					if let Some(mut metadata) =
+						SpacedriveLocationMetadataFile::try_load(path).await?
+					{
+						metadata
+							.update(library.id, maybe_missing(name, "location.name")?)
+							.await?;
+					}
 				}
+			}
+
+			if self.path.is_some() {
+				node.locations.remove(self.id, library.clone()).await?;
+				node.locations.add(self.id, library.clone()).await?;
 			}
 		}
 
@@ -325,7 +395,10 @@ impl LocationUpdateArgs {
 	}
 }
 
-pub fn find_location(library: &Library, location_id: i32) -> location::FindUniqueQuery {
+pub fn find_location(
+	library: &Library,
+	location_id: location::id::Type,
+) -> location::FindUniqueQuery {
 	library
 		.db
 		.location()
@@ -334,7 +407,7 @@ pub fn find_location(library: &Library, location_id: i32) -> location::FindUniqu
 
 async fn link_location_and_indexer_rules(
 	library: &Library,
-	location_id: i32,
+	location_id: location::id::Type,
 	rules_ids: &[i32],
 ) -> Result<(), LocationError> {
 	library
@@ -352,160 +425,243 @@ async fn link_location_and_indexer_rules(
 	Ok(())
 }
 
+#[instrument(
+	skip(node, library, location),
+	fields(library_id = %library.id, location_id = %location.id),
+	err,
+)]
 pub async fn scan_location(
-	library: &Library,
+	node: &Arc<Node>,
+	library: &Arc<Library>,
 	location: location_with_indexer_rules::Data,
-) -> Result<(), JobManagerError> {
-	if location.node_id != library.node_local_id {
-		return Ok(());
+	location_scan_state: ScanState,
+) -> Result<Option<JobId>, sd_core_heavy_lifting::Error> {
+	// TODO(N): This isn't gonna work with removable media and this will likely permanently break if the DB is restored from a backup.
+	if location.instance_id != Some(library.config().await.instance_id) {
+		warn!("Tried to scan a location on a different instance");
+		return Ok(None);
 	}
+
+	let location_id = location.id;
+	let ctx = NodeContext {
+		node: Arc::clone(node),
+		library: Arc::clone(library),
+	};
 
 	let location_base_data = location::Data::from(&location);
 
-	library
-		.spawn_job(
-			Job::new_with_action(
-				IndexerJobInit {
-					location,
-					sub_path: None,
-				},
-				"scan_location",
-			)
-			.queue_next(FileIdentifierJobInit {
-				location: location_base_data.clone(),
-				sub_path: None,
-			})
-			.queue_next(ThumbnailerJobInit {
-				location: location_base_data,
-				sub_path: None,
-			}),
-		)
-		.await
+	debug!("Scanning location");
+
+	let job_id = match location_scan_state {
+		ScanState::Pending | ScanState::Completed => {
+			node.job_system
+				.dispatch(
+					JobEnqueuer::new(Indexer::new(location, None)?)
+						.with_action("scan_location")
+						.with_metadata(ReportInputMetadata::Location(location_base_data.clone()))
+						.enqueue_next(FileIdentifier::new(location_base_data.clone(), None)?)
+						.enqueue_next(MediaProcessor::new(location_base_data, None, false)?),
+					location_id,
+					ctx.clone(),
+				)
+				.await?
+		}
+
+		ScanState::Indexed => {
+			node.job_system
+				.dispatch(
+					JobEnqueuer::new(FileIdentifier::new(location_base_data.clone(), None)?)
+						.with_action("scan_location_already_indexed")
+						.with_metadata(ReportInputMetadata::Location(location_base_data.clone()))
+						.enqueue_next(MediaProcessor::new(location_base_data, None, false)?),
+					location_id,
+					ctx.clone(),
+				)
+				.await?
+		}
+
+		ScanState::FilesIdentified => {
+			node.job_system
+				.dispatch(
+					JobEnqueuer::new(MediaProcessor::new(
+						location_base_data.clone(),
+						None,
+						false,
+					)?)
+					.with_action("scan_location_files_already_identified")
+					.with_metadata(ReportInputMetadata::Location(location_base_data)),
+					location_id,
+					ctx.clone(),
+				)
+				.await?
+		}
+	};
+
+	Ok(Some(job_id))
 }
 
-#[cfg(feature = "location-watcher")]
+#[instrument(
+	skip_all,
+	fields(
+		library_id = %library.id,
+		location_id = %location.id,
+		sub_path = %sub_path.as_ref().display(),
+	),
+	err,
+)]
 pub async fn scan_location_sub_path(
-	library: &Library,
+	node: &Arc<Node>,
+	library: &Arc<Library>,
 	location: location_with_indexer_rules::Data,
-	sub_path: impl AsRef<Path>,
-) -> Result<(), JobManagerError> {
+	sub_path: impl AsRef<Path> + Send,
+) -> Result<Option<JobId>, sd_core_heavy_lifting::Error> {
 	let sub_path = sub_path.as_ref().to_path_buf();
-	if location.node_id != library.node_local_id {
-		return Ok(());
+
+	// TODO(N): This isn't gonna work with removable media and this will likely permanently break if the DB is restored from a backup.
+	if location.instance_id != Some(library.config().await.instance_id) {
+		warn!("Tried to scan a location on a different instance");
+		return Ok(None);
 	}
+
+	let location_id = location.id;
+	let ctx = NodeContext {
+		node: Arc::clone(node),
+		library: Arc::clone(library),
+	};
 
 	let location_base_data = location::Data::from(&location);
 
-	library
-		.spawn_job(
-			Job::new_with_action(
-				IndexerJobInit {
-					location,
-					sub_path: Some(sub_path.clone()),
-				},
-				"scan_location_sub_path",
-			)
-			.queue_next(FileIdentifierJobInit {
-				location: location_base_data.clone(),
-				sub_path: Some(sub_path.clone()),
-			})
-			.queue_next(ThumbnailerJobInit {
-				location: location_base_data,
-				sub_path: Some(sub_path),
-			}),
+	debug!("Scanning location on a sub path");
+
+	node.job_system
+		.dispatch(
+			JobEnqueuer::new(Indexer::new(location, Some(sub_path.clone()))?)
+				.with_action("scan_location")
+				.with_metadata(ReportInputMetadata::Location(location_base_data.clone()))
+				.with_metadata(ReportInputMetadata::SubPath(sub_path.clone()))
+				.enqueue_next(FileIdentifier::new(
+					location_base_data.clone(),
+					Some(sub_path.clone()),
+				)?)
+				.enqueue_next(MediaProcessor::new(
+					location_base_data,
+					Some(sub_path),
+					false,
+				)?),
+			location_id,
+			ctx.clone(),
 		)
 		.await
+		.map_err(Into::into)
+		.map(Some)
 }
 
+#[instrument(
+	skip_all,
+	fields(
+		library_id = %library.id,
+		location_id = %location.id,
+		sub_path = %sub_path.as_ref().display(),
+	),
+	err,
+)]
 pub async fn light_scan_location(
-	library: &Library,
+	node: Arc<Node>,
+	library: Arc<Library>,
 	location: location_with_indexer_rules::Data,
 	sub_path: impl AsRef<Path>,
-) -> Result<(), JobManagerError> {
+) -> Result<(), sd_core_heavy_lifting::Error> {
 	let sub_path = sub_path.as_ref().to_path_buf();
-	if location.node_id != library.node_local_id {
+
+	// TODO(N): This isn't gonna work with removable media and this will likely permanently break if the DB is restored from a backup.
+	if location.instance_id != Some(library.config().await.instance_id) {
+		warn!("Tried to scan a location on a different instance");
 		return Ok(());
 	}
 
 	let location_base_data = location::Data::from(&location);
 
-	library
-		.spawn_job(
-			Job::new_with_action(
-				ShallowIndexerJobInit {
-					location,
-					sub_path: sub_path.clone(),
-				},
-				"light_scan_location",
-			)
-			.queue_next(ShallowFileIdentifierJobInit {
-				location: location_base_data.clone(),
-				sub_path: sub_path.clone(),
-			})
-			.queue_next(ShallowThumbnailerJobInit {
-				location: location_base_data,
-				sub_path,
-			}),
-		)
-		.await
-}
+	let dispatcher = node.task_system.get_dispatcher();
+	let ctx = NodeContext { node, library };
 
-pub async fn relink_location(
-	library: &Library,
-	location_path: impl AsRef<Path>,
-) -> Result<(), LocationError> {
-	let Library { db, id, sync, .. } = &library;
+	for e in indexer::shallow(location, &sub_path, &dispatcher, &ctx).await? {
+		error!(?e, "Shallow indexer errors;");
+	}
 
-	let mut metadata = SpacedriveLocationMetadataFile::try_load(&location_path)
-		.await?
-		.ok_or_else(|| LocationError::MissingMetadataFile(location_path.as_ref().to_path_buf()))?;
+	for e in
+		file_identifier::shallow(location_base_data.clone(), &sub_path, &dispatcher, &ctx).await?
+	{
+		error!(?e, "Shallow file identifier errors;");
+	}
 
-	metadata.relink(*id, &location_path).await?;
-
-	let pub_id = metadata.location_pub_id(library.id)?.as_ref().to_vec();
-	let path = location_path
-		.as_ref()
-		.to_str()
-		.expect("Found non-UTF-8 path")
-		.to_string();
-
-	sync.write_op(
-		db,
-		sync.shared_update(
-			sync::location::SyncId {
-				pub_id: pub_id.clone(),
-			},
-			location::path::NAME,
-			json!(path),
-		),
-		db.location().update(
-			location::pub_id::equals(pub_id),
-			vec![location::path::set(path)],
-		),
-	)
-	.await?;
+	for e in media_processor::shallow(location_base_data, &sub_path, &dispatcher, &ctx).await? {
+		error!(?e, "Shallow media processor errors;");
+	}
 
 	Ok(())
 }
 
-async fn create_location(
-	library: &Library,
-	location_pub_id: Uuid,
+#[instrument(
+	skip_all,
+	fields(
+		library_id = %id,
+		location_path = %location_path.as_ref().display(),
+	),
+	err,
+)]
+pub async fn relink_location(
+	Library { db, id, sync, .. }: &Library,
 	location_path: impl AsRef<Path>,
-	indexer_rules_ids: &[i32],
-	dry_run: bool,
-) -> Result<Option<location_with_indexer_rules::Data>, LocationError> {
-	let Library { db, sync, .. } = &library;
+) -> Result<location::id::Type, LocationError> {
+	let location_path = location_path.as_ref();
+	let mut metadata = SpacedriveLocationMetadataFile::try_load(&location_path)
+		.await?
+		.ok_or_else(|| LocationError::MissingMetadataFile(location_path.into()))?;
 
-	let mut path = location_path.as_ref().to_path_buf();
+	metadata.relink(*id, location_path).await?;
 
+	let pub_id = uuid_to_bytes(&metadata.location_pub_id(*id)?);
+	let path = location_path
+		.to_str()
+		.map(str::to_string)
+		.ok_or_else(|| NonUtf8PathError(location_path.into()))?;
+
+	let (sync_param, db_param) = sync_db_entry!(path, location::path);
+
+	let location_id = sync
+		.write_op(
+			db,
+			sync.shared_update(
+				prisma_sync::location::SyncId {
+					pub_id: pub_id.clone(),
+				},
+				[sync_param],
+			),
+			db.location()
+				.update(location::pub_id::equals(pub_id.clone()), vec![db_param])
+				.select(location::select!({ id })),
+		)
+		.await?
+		.id;
+
+	Ok(location_id)
+}
+
+#[derive(Debug)]
+pub struct CreatedLocationResult {
+	pub name: String,
+	pub data: location_with_indexer_rules::Data,
+}
+
+pub(crate) fn normalize_path(path: impl AsRef<Path>) -> io::Result<(String, String)> {
+	let mut path = path.as_ref().to_path_buf();
 	let (location_path, normalized_path) = path
 		// Normalize path and also check if it exists
 		.normalize()
 		.and_then(|normalized_path| {
 			if cfg!(windows) {
 				// Use normalized path as main path on Windows
-				// This ensures we always receive a valid windows formated path
+				// This ensures we always receive a valid windows formatted path
 				// ex: /Users/JohnDoe/Downloads will become C:\Users\JohnDoe\Downloads
 				// Internally `normalize` calls `GetFullPathNameW` on Windows
 				// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfullpathnamew
@@ -520,8 +676,7 @@ async fn create_location(
 				))?,
 				normalized_path,
 			))
-		})
-		.map_err(|_| LocationError::DirectoryNotFound(path.clone()))?;
+		})?;
 
 	// Not needed on Windows because the normalization already handles it
 	if cfg!(not(windows)) {
@@ -532,24 +687,6 @@ async fn create_location(
 				path = normalized_path.as_path().to_path_buf();
 			}
 		}
-	}
-
-	if library
-		.db
-		.location()
-		.count(vec![location::path::equals(location_path.clone())])
-		.exec()
-		.await? > 0
-	{
-		return Err(LocationError::LocationAlreadyExists(path));
-	}
-
-	if check_nested_location(&location_path, &library.db).await? {
-		return Err(LocationError::NestedLocation(path));
-	}
-
-	if dry_run {
-		return Ok(None);
 	}
 
 	// Use `to_string_lossy` because a partially corrupted but identifiable name is better than nothing
@@ -564,192 +701,252 @@ async fn create_location(
 		name = "Unknown".to_string()
 	}
 
-	let location = sync
+	Ok((location_path, name))
+}
+
+async fn create_location(
+	library @ Library { db, sync, .. }: &Library,
+	location_pub_id: Uuid,
+	location_path: impl AsRef<Path>,
+	indexer_rules_ids: &[i32],
+	dry_run: bool,
+) -> Result<Option<CreatedLocationResult>, LocationError> {
+	let location_path = location_path.as_ref();
+	let (path, name) = normalize_path(location_path)
+		.map_err(|_| LocationError::DirectoryNotFound(location_path.into()))?;
+
+	if db
+		.location()
+		.count(vec![location::path::equals(Some(path.clone()))])
+		.exec()
+		.await?
+		> 0
+	{
+		return Err(LocationError::LocationAlreadyExists(location_path.into()));
+	}
+
+	if check_nested_location(&location_path, db).await? {
+		return Err(LocationError::NestedLocation(location_path.into()));
+	}
+
+	if dry_run {
+		return Ok(None);
+	}
+
+	let (sync_values, mut db_params) = [
+		sync_db_entry!(&name, location::name),
+		sync_db_entry!(path, location::path),
+		sync_db_entry!(Utc::now(), location::date_created),
+		(
+			sync_entry!(
+				prisma_sync::device::SyncId {
+					pub_id: sync.device_pub_id.to_db()
+				},
+				location::device
+			),
+			location::device::connect(device::pub_id::equals(sync.device_pub_id.to_db())),
+		),
+	]
+	.into_iter()
+	.unzip::<_, _, Vec<_>, Vec<_>>();
+
+	// temporary workaround until we remove instances from locations
+	db_params.push(location::instance::connect(instance::id::equals(
+		library.config().await.instance_id,
+	)));
+
+	let location_id = sync
 		.write_op(
 			db,
-			sync.unique_shared_create(
-				sync::location::SyncId {
-					pub_id: location_pub_id.as_bytes().to_vec(),
+			sync.shared_create(
+				prisma_sync::location::SyncId {
+					pub_id: uuid_to_bytes(&location_pub_id),
 				},
-				[
-					(
-						location::node::NAME,
-						json!(sync::node::SyncId {
-							pub_id: uuid_to_bytes(library.id)
-						}),
-					),
-					(location::name::NAME, json!(&name)),
-					(location::path::NAME, json!(&location_path)),
-				],
+				sync_values,
 			),
 			db.location()
-				.create(
-					location_pub_id.as_bytes().to_vec(),
-					name,
-					location_path,
-					node::id::equals(library.node_local_id),
-					vec![],
-				)
-				.include(location_with_indexer_rules::include()),
+				.create(uuid_to_bytes(&location_pub_id), db_params)
+				.select(location::select!({ id })),
 		)
-		.await?;
+		.await?
+		.id;
 
-	debug!("created in db");
+	debug!("New location created in db");
 
 	if !indexer_rules_ids.is_empty() {
-		link_location_and_indexer_rules(library, location.id, indexer_rules_ids).await?;
+		link_location_and_indexer_rules(library, location_id, indexer_rules_ids).await?;
 	}
 
 	// Updating our location variable to include information about the indexer rules
-	let location = find_location(library, location.id)
+	let location = find_location(library, location_id)
 		.include(location_with_indexer_rules::include())
 		.exec()
 		.await?
-		.ok_or(LocationError::IdNotFound(location.id))?;
+		.ok_or(LocationError::IdNotFound(location_id))?;
 
 	invalidate_query!(library, "locations.list");
 
-	Ok(Some(location))
+	Ok(Some(CreatedLocationResult {
+		data: location,
+		name,
+	}))
 }
 
-pub async fn delete_location(library: &Library, location_id: i32) -> Result<(), LocationError> {
-	let Library { db, .. } = library;
+#[instrument(skip(node, library), fields(library_id = %library.id), err)]
+pub async fn delete_location(
+	node: &Node,
+	library: &Arc<Library>,
+	location_id: location::id::Type,
+) -> Result<(), LocationError> {
+	let Library { db, sync, .. } = library.as_ref();
+
+	let start = Instant::now();
+	node.locations.remove(location_id, library.clone()).await?;
+	debug!(elapsed_time = ?start.elapsed(), "Removed location from node;");
+
+	let start = Instant::now();
+	delete_directory(library, location_id, None).await?;
+	debug!(elapsed_time = ?start.elapsed(), "Deleted location file paths;");
+
+	let location = library
+		.db
+		.location()
+		.find_unique(location::id::equals(location_id))
+		.exec()
+		.await?
+		.ok_or(LocationError::IdNotFound(location_id))?;
+
+	let start = Instant::now();
+	// TODO: This should really be queued to the proper node so it will always run
+	// TODO: Deal with whether a location is online or not
+	// TODO(N): This isn't gonna work with removable media and this will likely permanently break if the DB is restored from a backup.
+	if location.instance_id == Some(library.config().await.instance_id) {
+		if let Some(path) = &location.path {
+			if let Ok(Some(mut metadata)) = SpacedriveLocationMetadataFile::try_load(path).await {
+				metadata
+					.clean_stale_libraries(
+						&node
+							.libraries
+							.get_all()
+							.await
+							.into_iter()
+							.map(|library| library.id)
+							.collect(),
+					)
+					.await?;
+
+				metadata.remove_library(library.id).await?;
+			}
+		}
+	}
+	debug!(elapsed_time = ?start.elapsed(), "Removed location metadata;");
+
+	let start = Instant::now();
 
 	library
-		.location_manager()
-		.remove(location_id, library.clone())
-		.await?;
-
-	delete_directory(library, location_id, None).await?;
-
-	db.indexer_rules_in_location()
+		.db
+		.indexer_rules_in_location()
 		.delete_many(vec![indexer_rules_in_location::location_id::equals(
 			location_id,
 		)])
 		.exec()
 		.await?;
+	debug!(elapsed_time = ?start.elapsed(), "Deleted indexer rules in location;");
 
-	let location = db
-		.location()
-		.delete(location::id::equals(location_id))
-		.exec()
-		.await?;
+	let start = Instant::now();
 
-	if location.node_id == library.node_local_id {
-		if let Ok(Some(mut metadata)) =
-			SpacedriveLocationMetadataFile::try_load(&location.path).await
-		{
-			metadata.remove_library(library.id).await?;
-		}
-	}
+	sync.write_op(
+		db,
+		sync.shared_delete(prisma_sync::location::SyncId {
+			pub_id: location.pub_id,
+		}),
+		db.location().delete(location::id::equals(location_id)),
+	)
+	.await?;
 
-	library.orphan_remover.invoke().await;
+	debug!(elapsed_time = ?start.elapsed(), "Deleted location from db;");
 
-	info!("Location {} deleted", location_id);
 	invalidate_query!(library, "locations.list");
+
+	info!("Location deleted");
 
 	Ok(())
 }
 
 /// Will delete a directory recursively with Objects if left as orphans
 /// this function is used to delete a location and when ingesting directory deletion events
+#[instrument(skip_all, err)]
 pub async fn delete_directory(
 	library: &Library,
-	location_id: i32,
-	parent_materialized_path: Option<String>,
-) -> Result<(), QueryError> {
+	location_id: location::id::Type,
+	parent_iso_file_path: Option<&IsolatedFilePathData<'_>>,
+) -> Result<(), sd_core_sync::Error> {
 	let Library { db, .. } = library;
 
-	let children_params = if let Some(parent_materialized_path) = parent_materialized_path {
-		vec![
-			file_path::location_id::equals(location_id),
-			file_path::materialized_path::starts_with(parent_materialized_path),
-		]
-	} else {
-		vec![file_path::location_id::equals(location_id)]
-	};
+	let children_params = sd_utils::chain_optional_iter(
+		[file_path::location_id::equals(Some(location_id))],
+		[parent_iso_file_path.and_then(|parent| {
+			parent
+				.materialized_path_for_children()
+				.map(|materialized_path| {
+					or![
+						and(filter_existing_file_path_params(parent)),
+						file_path::materialized_path::starts_with(materialized_path),
+					]
+				})
+		})],
+	);
 
-	// Fetching all object_ids from all children file_paths
-	let object_ids = db
+	let pub_ids = library
+		.db
 		.file_path()
 		.find_many(children_params.clone())
-		.select(file_path::select!({ object_id }))
+		.select(file_path::select!({ pub_id }))
 		.exec()
 		.await?
 		.into_iter()
-		.filter_map(|file_path| file_path.object_id)
-		.collect();
+		.map(|fp| fp.pub_id)
+		.collect::<Vec<_>>();
 
-	// WARNING: file_paths must be deleted before objects, as they reference objects through object_id
-	// delete all children file_paths
-	db.file_path().delete_many(children_params).exec().await?;
+	if pub_ids.is_empty() {
+		debug!("No file paths to delete");
+		return Ok(());
+	}
 
-	// delete all children objects
-	db.object()
-		.delete_many(vec![
-			object::id::in_vec(object_ids),
-			// https://www.prisma.io/docs/reference/api-reference/prisma-client-reference#none
-			object::file_paths::none(vec![]),
-		])
-		.exec()
+	library
+		.sync
+		.write_ops(
+			&library.db,
+			(
+				pub_ids
+					.into_iter()
+					.map(|pub_id| {
+						library
+							.sync
+							.shared_delete(prisma_sync::file_path::SyncId { pub_id })
+					})
+					.collect(),
+				db.file_path().delete_many(children_params),
+			),
+		)
 		.await?;
 
+	// library.orphan_remover.invoke().await;
+
 	invalidate_query!(library, "search.paths");
+	invalidate_query!(library, "search.objects");
 
 	Ok(())
 }
 
-impl From<location_with_indexer_rules::Data> for location::Data {
-	fn from(data: location_with_indexer_rules::Data) -> Self {
-		Self {
-			id: data.id,
-			pub_id: data.pub_id,
-			path: data.path,
-			node_id: data.node_id,
-			name: data.name,
-			total_capacity: data.total_capacity,
-			available_capacity: data.available_capacity,
-			is_archived: data.is_archived,
-			generate_preview_media: data.generate_preview_media,
-			sync_preview_media: data.sync_preview_media,
-			hidden: data.hidden,
-			date_created: data.date_created,
-			node: None,
-			file_paths: None,
-			indexer_rules: None,
-		}
-	}
-}
-
-impl From<&location_with_indexer_rules::Data> for location::Data {
-	fn from(data: &location_with_indexer_rules::Data) -> Self {
-		Self {
-			id: data.id,
-			pub_id: data.pub_id.clone(),
-			path: data.path.clone(),
-			node_id: data.node_id,
-			name: data.name.clone(),
-			total_capacity: data.total_capacity,
-			available_capacity: data.available_capacity,
-			is_archived: data.is_archived,
-			generate_preview_media: data.generate_preview_media,
-			sync_preview_media: data.sync_preview_media,
-			hidden: data.hidden,
-			date_created: data.date_created,
-			node: None,
-			file_paths: None,
-			indexer_rules: None,
-		}
-	}
-}
-
+#[instrument(skip_all, err)]
 async fn check_nested_location(
 	location_path: impl AsRef<Path>,
 	db: &PrismaClient,
 ) -> Result<bool, QueryError> {
 	let location_path = location_path.as_ref();
 
-	let (parents_count, children_count) = db
+	let (parents_count, potential_children) = db
 		._batch((
 			db.location().count(vec![location::path::in_vec(
 				location_path
@@ -762,7 +959,7 @@ async fn check_nested_location(
 					})
 					.collect(),
 			)]),
-			db.location().count(vec![location::path::starts_with(
+			db.location().find_many(vec![location::path::starts_with(
 				location_path
 					.to_str()
 					.map(str::to_string)
@@ -771,5 +968,188 @@ async fn check_nested_location(
 		))
 		.await?;
 
-	Ok(parents_count > 0 || children_count > 0)
+	let comps = location_path.components().collect::<Vec<_>>();
+	let is_a_child_location = potential_children.into_iter().any(|v| {
+		let Some(location_path) = v.path else {
+			warn!(
+				location_id = %v.id,
+				"Missing location path on location at check nested location",
+			);
+			return false;
+		};
+		let comps2 = PathBuf::from(location_path);
+		let comps2 = comps2.components().collect::<Vec<_>>();
+
+		if comps.len() > comps2.len() {
+			return false;
+		}
+
+		for (a, b) in comps.iter().zip(comps2.iter()) {
+			if a != b {
+				return false;
+			}
+		}
+
+		true
+	});
+
+	Ok(parents_count > 0 || is_a_child_location)
+}
+
+#[instrument(skip_all, err)]
+pub async fn update_location_size(
+	location_id: location::id::Type,
+	location_pub_id: location::pub_id::Type,
+	library: &Library,
+) -> Result<(), sd_core_sync::Error> {
+	let Library { db, sync, .. } = library;
+
+	let total_size = size_in_bytes_to_db(
+		db.file_path()
+			.find_many(vec![
+				file_path::location_id::equals(Some(location_id)),
+				file_path::materialized_path::equals(Some("/".to_string())),
+			])
+			.select(file_path::select!({ size_in_bytes_bytes }))
+			.exec()
+			.await?
+			.into_iter()
+			.filter_map(|file_path| {
+				file_path
+					.size_in_bytes_bytes
+					.map(|size_in_bytes_bytes| size_in_bytes_from_db(&size_in_bytes_bytes))
+			})
+			.sum::<u64>(),
+	);
+
+	let (sync_param, db_param) = sync_db_entry!(total_size, location::size_in_bytes);
+
+	sync.write_op(
+		db,
+		sync.shared_update(
+			prisma_sync::location::SyncId {
+				pub_id: location_pub_id,
+			},
+			[sync_param],
+		),
+		db.location()
+			.update(location::id::equals(location_id), vec![db_param])
+			.select(location::select!({ id })),
+	)
+	.await?;
+
+	invalidate_query!(library, "locations.list");
+	invalidate_query!(library, "locations.get");
+
+	Ok(())
+}
+
+#[instrument(skip_all, err)]
+pub async fn get_location_path_from_location_id(
+	db: &PrismaClient,
+	location_id: file_path::id::Type,
+) -> Result<PathBuf, LocationError> {
+	db.location()
+		.find_unique(location::id::equals(location_id))
+		.exec()
+		.await
+		.map_err(Into::into)
+		.and_then(|maybe_location| {
+			maybe_location
+				.ok_or(LocationError::IdNotFound(location_id))
+				.and_then(|location| {
+					location
+						.path
+						.map(PathBuf::from)
+						.ok_or(LocationError::MissingPath(location_id))
+				})
+		})
+}
+
+#[instrument(skip_all, err)]
+pub async fn create_file_path(
+	crate::location::Library { db, sync, .. }: &crate::location::Library,
+	IsolatedFilePathDataParts {
+		materialized_path,
+		is_dir,
+		location_id,
+		name,
+		extension,
+		..
+	}: IsolatedFilePathDataParts<'_>,
+	cas_id: Option<CasId<'_>>,
+	metadata: sd_core_file_path_helper::FilePathMetadata,
+) -> Result<file_path::Data, sd_core_file_path_helper::FilePathError> {
+	use sd_utils::db::inode_to_db;
+
+	use sd_prisma::prisma;
+
+	let indexed_at = Utc::now();
+
+	let location = db
+		.location()
+		.find_unique(location::id::equals(location_id))
+		.select(location::select!({ id pub_id }))
+		.exec()
+		.await?
+		.ok_or(sd_core_file_path_helper::FilePathError::LocationNotFound(
+			location_id,
+		))?;
+
+	let device_pub_id = sync.device_pub_id.to_db();
+
+	let (sync_params, db_params) = [
+		(
+			sync_entry!(
+				prisma_sync::location::SyncId {
+					pub_id: location.pub_id
+				},
+				file_path::location
+			),
+			file_path::location::connect(prisma::location::id::equals(location.id)),
+		),
+		(
+			sync_entry!(cas_id, file_path::cas_id),
+			file_path::cas_id::set(cas_id.map(Into::into)),
+		),
+		sync_db_entry!(materialized_path, file_path::materialized_path),
+		sync_db_entry!(name, file_path::name),
+		sync_db_entry!(extension, file_path::extension),
+		sync_db_entry!(
+			size_in_bytes_to_db(metadata.size_in_bytes),
+			file_path::size_in_bytes_bytes
+		),
+		sync_db_entry!(inode_to_db(metadata.inode), file_path::inode),
+		sync_db_entry!(is_dir, file_path::is_dir),
+		sync_db_entry!(metadata.created_at, file_path::date_created),
+		sync_db_entry!(metadata.modified_at, file_path::date_modified),
+		sync_db_entry!(indexed_at, file_path::date_indexed),
+		sync_db_entry!(metadata.hidden, file_path::hidden),
+		(
+			sync_entry!(
+				prisma_sync::device::SyncId {
+					pub_id: device_pub_id.clone()
+				},
+				file_path::device
+			),
+			file_path::device::connect(prisma::device::pub_id::equals(device_pub_id)),
+		),
+	]
+	.into_iter()
+	.unzip::<_, _, Vec<_>, Vec<_>>();
+
+	let pub_id = sd_utils::uuid_to_bytes(&Uuid::now_v7());
+
+	sync.write_op(
+		db,
+		sync.shared_create(
+			prisma_sync::file_path::SyncId {
+				pub_id: pub_id.clone(),
+			},
+			sync_params,
+		),
+		db.file_path().create(pub_id, db_params),
+	)
+	.await
+	.map_err(Into::into)
 }

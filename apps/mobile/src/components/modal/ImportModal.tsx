@@ -1,42 +1,126 @@
+import * as RNFS from '@dr.pogodin/react-native-fs';
 import { forwardRef, useCallback } from 'react';
-import { Alert, Text, View } from 'react-native';
+import { Alert, NativeModules, Platform, Text, View } from 'react-native';
 import DocumentPicker from 'react-native-document-picker';
-import { useLibraryMutation } from '@sd/client';
+import { useLibraryMutation, useLibraryQuery, useRspcLibraryContext } from '@sd/client';
 import { Modal, ModalRef } from '~/components/layout/Modal';
 import { Button } from '~/components/primitive/Button';
 import useForwardedRef from '~/hooks/useForwardedRef';
 import { tw } from '~/lib/tailwind';
 
-// import RFS from 'react-native-fs';
+import { Icon } from '../icons/Icon';
+import { toast } from '../primitive/Toast';
+
+const { NativeFunctions } = NativeModules;
+
+interface DirectoryPickerResult {
+	path: string;
+	bookmarkFile: string;
+}
+
+interface DirectoryPickerModule {
+	pickDirectory(): Promise<DirectoryPickerResult>;
+	resolveBookmark(bookmarkFileName: string): Promise<{ path: string }>;
+}
+
 // import * as ML from 'expo-media-library';
 
 // WIP component
 const ImportModal = forwardRef<ModalRef, unknown>((_, ref) => {
 	const modalRef = useForwardedRef(ref);
+	const isAndroid = Platform.OS === 'android';
+	const addLocationToLibrary = useLibraryMutation('locations.addLibrary');
+	const relinkLocation = useLibraryMutation('locations.relink');
+	const rspc = useRspcLibraryContext();
 
-	const { mutate: createLocation } = useLibraryMutation('locations.create', {
-		onError: (error) => {
-			console.error(error);
+	const createLocation = useLibraryMutation('locations.create', {
+		onError: (error, variables) => {
+			modalRef.current?.close();
+			//custom message handling
+			if (error.message.startsWith('location already exists')) {
+				return toast.error('This location has already been added');
+			} else if (error.message.startsWith('nested location currently')) {
+				return toast.error('Nested locations are currently not supported');
+			}
+			switch (error.message) {
+				case 'NEED_RELINK':
+					if (!variables.dry_run) relinkLocation.mutate(variables.path);
+					toast.info('Please relink the location');
+					break;
+				case 'ADD_LIBRARY':
+					addLocationToLibrary.mutate(variables);
+					break;
+				default:
+					toast.error(error.message);
+					throw new Error('Unimplemented custom remote error handling');
+			}
+		},
+		onSuccess: async (data) => {
+			// Fetch the location's path using the location number
+			const location = await rspc.client.query(['locations.get', data!]);
+			const locationPath = location?.path;
+			try {
+				// These arguments cannot be null due to compatability with Android (React Native throws an error if even the type is nullable)
+				await NativeFunctions.saveLocation(locationPath!, data!);
+			} catch (error) {
+				console.error('Error saving location:', error);
+				toast.error('Error saving location bookmark');
+				return;
+			}
+			toast.success('Location added successfully');
 		},
 		onSettled: () => {
-			// Close the modal
+			rspc.queryClient.invalidateQueries({ queryKey: ['locations.list'] });
 			modalRef.current?.close();
 		}
 	});
 
 	const handleFilesButton = useCallback(async () => {
+		const response = await DocumentPicker.pickDirectory({
+			presentationStyle: 'pageSheet'
+		});
+
+		if (!response) return;
+
+		const uri = response.uri;
+
 		try {
-			const response = await DocumentPicker.pickDirectory({
-				presentationStyle: 'pageSheet'
-			});
+			if (Platform.OS === 'android') {
+				const response = await DocumentPicker.pickDirectory({
+					presentationStyle: 'pageSheet'
+				});
 
-			if (!response) return;
+				if (!response) return;
 
-			createLocation({
-				path: decodeURIComponent(response.uri.replace('file://', '')),
-				dry_run: false,
-				indexer_rules_ids: []
-			});
+				const uri = response.uri;
+
+				// The following code turns this: content://com.android.externalstorage.documents/tree/[filePath] into this: /storage/emulated/0/[directoryName]
+				// Example: content://com.android.externalstorage.documents/tree/primary%3ADownload%2Ftest into /storage/emulated/0/Download/test
+				const dirName = decodeURIComponent(uri).split('/');
+				// Remove all elements before 'tree'
+				dirName.splice(0, dirName.indexOf('tree') + 1);
+				const parsedDirName = dirName.join('/').split(':')[1];
+				const dirPath = RNFS.ExternalStorageDirectoryPath + '/' + parsedDirName;
+				//Verify that the directory exists
+				const dirExists = await RNFS.exists(dirPath);
+				if (!dirExists) {
+					console.error('Directory does not exist'); //TODO: Make this a UI error
+					return;
+				}
+
+				createLocation.mutate({
+					path: dirPath,
+					dry_run: false,
+					indexer_rules_ids: []
+				});
+			} else {
+				// iOS
+				createLocation.mutate({
+					path: decodeURIComponent(uri.replace('file://', '')),
+					dry_run: false,
+					indexer_rules_ids: []
+				});
+			}
 		} catch (err) {
 			console.error(err);
 		}
@@ -131,18 +215,27 @@ const ImportModal = forwardRef<ModalRef, unknown>((_, ref) => {
 	// }, []);
 
 	return (
-		<Modal ref={modalRef} snapPoints={['25']}>
-			<View style={tw`flex-1 px-8 pb-2 pt-8`}>
+		<Modal ref={modalRef} snapPoints={['20']}>
+			<View style={tw`flex-1 flex-row justify-evenly gap-2 px-8 pt-6`}>
 				{/* <Button variant="accent" style={tw`my-2`} onPress={testFN}>
 					<Text>TEST</Text>
 				</Button> */}
-				<Button variant="accent" style={tw`my-2`} onPress={handleFilesButton}>
-					<Text>Import from Files</Text>
+				<Button
+					variant="darkgray"
+					style={tw`h-20 w-40 items-center justify-center gap-1`}
+					onPress={handleFilesButton}
+				>
+					<Icon name="Folder" size={36} />
+					<Text style={tw`text-sm font-medium text-white`}>Import from Files</Text>
 				</Button>
-				<Button variant="accent" onPress={handlePhotosButton}>
-					<Text>Import from Photos</Text>
+				<Button
+					variant="darkgray"
+					style={tw`h-20 w-40 items-center justify-center gap-1`}
+					onPress={handlePhotosButton}
+				>
+					<Icon name={isAndroid ? 'AndroidPhotos' : 'ApplePhotos'} size={32} />
+					<Text style={tw`text-sm font-medium text-white`}>Import from Photos</Text>
 				</Button>
-				<Text style={tw`mt-4 text-center text-white`}>TODO</Text>
 			</View>
 		</Modal>
 	);

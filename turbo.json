@@ -2,6 +2,7 @@
 	"$schema": "https://turborepo.org/schema.json",
 	"pipeline": {
 		"build": {
+			"inputs": ["**/*.ts", "!src-tauri/**", "!node_modules/**"],
 			"dependsOn": ["^build"],
 			"outputs": ["dist/**"]
 		},
@@ -15,5 +16,14 @@
 			"cache": false
 		}
 	},
-	"globalEnv": ["PORT", "NODE_ENV"]
+	"globalEnv": [
+		"PORT",
+		"NODE_ENV",
+		"GENERATE_SOURCEMAP",
+		"DEV",
+		"VITE_SDSERVER_ORIGIN",
+		"VITE_SD_DEMO_MODE",
+		"VITE_SDSERVER_ORIGIN",
+		"VITE_LANDING_ORIGIN"
+	]
 }

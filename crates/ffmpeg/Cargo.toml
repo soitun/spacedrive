@@ -1,23 +1,31 @@
 [package]
-name = "sd-ffmpeg"
+name    = "sd-ffmpeg"
 version = "0.1.0"
-authors = ["Ericson Soares <ericson.ds999@gmail.com>"]
-edition = "2021"
-readme = "README.md"
-description = "A simple library to generate video thumbnails using ffmpeg with the webp format"
-license = "MIT"
-rust-version = "1.64.0"
-resolver = "2"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+authors                = ["Ericson Soares <ericson@spacedrive.com>", "Vítor Vasconcellos <vitor@spacedrive.com>"]
+description            = "A simple library to generate video thumbnails using ffmpeg with the webp format"
+edition.workspace      = true
+license.workspace      = true
+readme                 = "README.md"
+repository.workspace   = true
+rust-version.workspace = true
 
 [dependencies]
-ffmpeg-sys-next = "6.0.0"
+# Spacedrive Sub-crates
+sd-utils = { path = "../utils" }
 
-thiserror = "1.0.37"
-webp = "0.2.2"
-tokio = { workspace = true, features = ["fs", "rt"] }
+# Workspace dependencies
+chrono    = { workspace = true, features = ["serde"] }
+image     = { workspace = true }
+libc      = { workspace = true }
+thiserror = { workspace = true }
+tokio     = { workspace = true, features = ["fs", "rt"] }
+tracing   = { workspace = true }
+webp      = { workspace = true }
+
+# Specific FFmpeg dependencies
+ffmpeg-sys-next = "7.0"
 
 [dev-dependencies]
-tempfile = "3.3.0"
-tokio = { workspace = true, features = ["fs", "rt", "macros"] }
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["fs", "macros", "rt"] }

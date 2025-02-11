@@ -1,24 +1,25 @@
 import clsx from 'clsx';
 import { HexColorInput, HexColorPicker } from 'react-colorful';
-import { FieldValues, UseControllerProps, useController } from 'react-hook-form';
-import { Popover, inputStyles } from '@sd/ui';
+import { FieldValues, useController, UseControllerProps } from 'react-hook-form';
+import { inputStyles, Popover, usePopover } from '@sd/ui';
 
 interface Props<T extends FieldValues> extends UseControllerProps<T> {
 	className?: string;
 }
 
-export default <T extends FieldValues>({ className, ...props }: Props<T>) => {
+export const ColorPicker = <T extends FieldValues>({ className, ...props }: Props<T>) => {
 	const { field } = useController({ name: props.name });
 
 	return (
 		<Popover
+			popover={usePopover()}
 			trigger={
 				<div
-					className={clsx('h-4 w-4 rounded-full shadow', className)}
+					className={clsx('size-4 rounded-full shadow', className)}
 					style={{ backgroundColor: field.value }}
 				/>
 			}
-			className="p-3"
+			className="relative z-[110] p-3"
 			sideOffset={5}
 		>
 			<HexColorPicker color={field.value} onChange={field.onChange} />

@@ -1,43 +1,56 @@
 import { useQueryClient } from '@tanstack/react-query';
-import { useBridgeMutation, usePlausibleEvent } from '@sd/client';
-import { Dialog, UseDialogProps, forms, useDialog } from '@sd/ui';
-
-const { useZodForm, z } = forms;
+import { useNavigate } from 'react-router';
+import { useBridgeMutation, usePlausibleEvent, useZodForm } from '@sd/client';
+import { Dialog, useDialog, UseDialogProps } from '@sd/ui';
+import { useLocale } from '~/hooks';
+import { usePlatform } from '~/util/Platform';
 
 interface Props extends UseDialogProps {
 	libraryUuid: string;
 }
 
 export default function DeleteLibraryDialog(props: Props) {
-	const dialog = useDialog(props);
-	const submitPlausibleEvent = usePlausibleEvent();
+	const { t } = useLocale();
 
+	const submitPlausibleEvent = usePlausibleEvent();
 	const queryClient = useQueryClient();
-	const deleteLib = useBridgeMutation('library.delete', {
-		onSuccess: () => {
-			queryClient.invalidateQueries(['library.list']);
+	const platform = usePlatform();
+	const navigate = useNavigate();
+
+	const deleteLib = useBridgeMutation('library.delete');
+
+	const form = useZodForm();
+
+	const onSubmit = form.handleSubmit(async () => {
+		try {
+			await deleteLib.mutateAsync(props.libraryUuid);
+
+			queryClient.invalidateQueries({ queryKey: ['library.list'] });
+
+			if (platform.refreshMenuBar) platform.refreshMenuBar();
 
 			submitPlausibleEvent({
 				event: {
 					type: 'libraryDelete'
 				}
 			});
+
+			navigate('/');
+		} catch (e) {
+			alert(`Failed to delete library: ${e}`);
 		}
 	});
-
-	const form = useZodForm({ schema: z.object({}) });
-
-	const onSubmit = form.handleSubmit(() => deleteLib.mutateAsync(props.libraryUuid));
 
 	return (
 		<Dialog
 			form={form}
 			onSubmit={onSubmit}
-			dialog={dialog}
-			title="Delete Library"
-			description="Deleting a library will permanently the database, the files themselves will not be deleted."
+			dialog={useDialog(props)}
+			title={t('delete_library')}
+			closeLabel={t('close')}
+			description={t('delete_library_description')}
 			ctaDanger
-			ctaLabel="Delete"
+			ctaLabel={t('delete')}
 		/>
 	);
 }

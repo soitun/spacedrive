@@ -3,162 +3,371 @@
 	windows_subsystem = "windows"
 )]
 
-use std::{path::PathBuf, time::Duration};
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use sd_core::{custom_uri::create_custom_uri_endpoint, Node, NodeError};
+use std::{fs, path::PathBuf, process::Command, sync::Arc, time::Duration};
 
-use tauri::{
-	api::path, async_runtime::block_on, ipc::RemoteDomainAccessScope, plugin::TauriPlugin, Manager,
-	RunEvent, Runtime,
-};
-use tokio::{task::block_in_place, time::sleep};
+use menu::{set_enabled, MenuEvent};
+use sd_core::{Node, NodeError};
+
+use sd_fda::DiskAccess;
+use serde::{Deserialize, Serialize};
+use specta_typescript::Typescript;
+use tauri::{async_runtime::block_on, webview::PlatformWebview, AppHandle, Manager, WindowEvent};
+use tauri::{Emitter, Listener};
+use tauri_plugins::{sd_error_plugin, sd_server_plugin};
+use tauri_specta::{collect_events, Builder};
+use tokio::task::block_in_place;
+use tokio::time::sleep;
 use tracing::{debug, error};
 
-#[cfg(target_os = "linux")]
-mod app_linux;
-
+mod drag;
 mod file;
 mod menu;
+mod tauri_plugins;
+mod theme;
+mod updater;
 
 #[tauri::command(async)]
 #[specta::specta]
-async fn app_ready(app_handle: tauri::AppHandle) {
-	let window = app_handle.get_window("main").unwrap();
-
+async fn app_ready(app_handle: AppHandle) {
+	let window = app_handle.get_webview_window("main").unwrap();
 	window.show().unwrap();
 }
 
-pub fn tauri_error_plugin<R: Runtime>(err: NodeError) -> TauriPlugin<R> {
-	tauri::plugin::Builder::new("spacedrive")
-		.js_init_script(format!(r#"window.__SD_ERROR__ = "{err}";"#))
-		.build()
+#[tauri::command(async)]
+#[specta::specta]
+// If this errors, we don't have FDA and we need to re-prompt for it
+async fn request_fda_macos() {
+	DiskAccess::request_fda().expect("Unable to request full disk access");
 }
 
-macro_rules! tauri_handlers {
-	($($name:path),+) => {{
-		#[cfg(debug_assertions)]
-		tauri_specta::ts::export(specta::collect_types![$($name),+], "../src/commands.ts").unwrap();
+#[tauri::command(async)]
+#[specta::specta]
+async fn set_menu_bar_item_state(window: tauri::Window, event: MenuEvent, enabled: bool) {
+	let menu = window
+		.menu()
+		.expect("unable to get menu for current window");
 
-		tauri::generate_handler![$($name),+]
-	}};
+	set_enabled(&menu, event, enabled);
 }
 
-#[tokio::main]
-async fn main() -> tauri::Result<()> {
+#[tauri::command(async)]
+#[specta::specta]
+async fn reload_webview(app_handle: AppHandle) {
+	app_handle
+		.get_webview_window("main")
+		.expect("Error getting window handle")
+		.with_webview(reload_webview_inner)
+		.expect("Error while reloading webview");
+}
+
+fn reload_webview_inner(webview: PlatformWebview) {
+	#[cfg(target_os = "macos")]
+	{
+		unsafe {
+			sd_desktop_macos::reload_webview(&webview.inner().cast());
+		}
+	}
 	#[cfg(target_os = "linux")]
-	let (tx, rx) = tokio::sync::mpsc::channel(1);
+	{
+		use webkit2gtk::WebViewExt;
 
-	let data_dir = path::data_dir()
-		.unwrap_or_else(|| PathBuf::from("./"))
+		webview.inner().reload();
+	}
+	#[cfg(target_os = "windows")]
+	unsafe {
+		webview
+			.controller()
+			.CoreWebView2()
+			.expect("Unable to get handle on inner webview")
+			.Reload()
+			.expect("Unable to reload webview");
+	}
+}
+
+#[tauri::command(async)]
+#[specta::specta]
+async fn reset_spacedrive(app_handle: AppHandle) {
+	let data_dir = app_handle
+		.path()
+		.data_dir()
+		.unwrap_or_else(|_| PathBuf::from("./"))
 		.join("spacedrive");
 
 	#[cfg(debug_assertions)]
 	let data_dir = data_dir.join("dev");
 
-	let result = Node::new(data_dir).await;
+	fs::remove_dir_all(data_dir).unwrap();
 
-	let app = tauri::Builder::default();
-	let (node, app) = match result {
-		Ok((node, router)) => {
-			// This is a super cringe workaround for: https://github.com/tauri-apps/tauri/issues/3725 & https://bugs.webkit.org/show_bug.cgi?id=146351#c5
-			#[cfg(target_os = "linux")]
-			let app = app_linux::setup(app, rx, create_custom_uri_endpoint(node.clone()).axum()).await;
-			let app = app
-				.register_uri_scheme_protocol(
-					"spacedrive",
-					create_custom_uri_endpoint(node.clone()).tauri_uri_scheme("spacedrive"),
-				)
-				.plugin(rspc::integrations::tauri::plugin(router, {
-					let node = node.clone();
-					move || node.clone()
-				}))
-				.manage(node.clone());
+	// TODO: Restarting the app doesn't work in dev (cause Tauri's devserver shutdown) and in prod makes the app go unresponsive until you click in/out on macOS
+	// app_handle.restart();
 
-			(Some(node), app)
-		}
-		Err(err) => (None, app.plugin(tauri_error_plugin(err))),
-	};
+	app_handle.exit(0);
+}
 
-	let app = app
-		.setup(|app| {
-			#[cfg(feature = "updater")]
-			tauri::updater::builder(app.handle()).should_install(|_current, _latest| true);
+#[tauri::command(async)]
+#[specta::specta]
+async fn refresh_menu_bar(node: tauri::State<'_, Arc<Node>>, app: AppHandle) -> Result<(), ()> {
+	let has_library = !node.libraries.get_all().await.is_empty();
+	menu::refresh_menu_bar(&app, has_library);
+	Ok(())
+}
 
-			let app = app.handle();
+#[tauri::command(async)]
+#[specta::specta]
+async fn open_logs_dir(node: tauri::State<'_, Arc<Node>>) -> Result<(), ()> {
+	let logs_path = node.data_dir.join("logs");
 
-			app.windows().iter().for_each(|(_, window)| {
-				// window.hide().unwrap();
+	#[cfg(target_os = "linux")]
+	let open_result = sd_desktop_linux::open_file_path(logs_path);
 
-				tokio::spawn({
-					let window = window.clone();
-					async move {
-						sleep(Duration::from_secs(3)).await;
-						if !window.is_visible().unwrap_or(true) {
-							println!(
-							"Window did not emit `app_ready` event fast enough. Showing window..."
-						);
-							let _ = window.show();
+	#[cfg(not(target_os = "linux"))]
+	let open_result = opener::open(logs_path);
+
+	open_result.map_err(|e| {
+		error!("Failed to open logs dir: {e:#?}");
+	})
+}
+
+#[tauri::command(async)]
+#[specta::specta]
+async fn open_trash_in_os_explorer() -> Result<(), ()> {
+	#[cfg(target_os = "macos")]
+	{
+		let full_path = format!("{}/.Trash/", std::env::var("HOME").unwrap());
+
+		Command::new("open")
+			.arg(full_path)
+			.spawn()
+			.map_err(|err| error!("Error opening trash: {err:#?}"))?
+			.wait()
+			.map_err(|err| error!("Error opening trash: {err:#?}"))?;
+
+		Ok(())
+	}
+
+	#[cfg(target_os = "windows")]
+	{
+		Command::new("explorer")
+			.arg("shell:RecycleBinFolder")
+			.spawn()
+			.map_err(|err| error!("Error opening trash: {err:#?}"))?
+			.wait()
+			.map_err(|err| error!("Error opening trash: {err:#?}"))?;
+		return Ok(());
+	}
+
+	#[cfg(target_os = "linux")]
+	{
+		Command::new("xdg-open")
+			.arg("trash://")
+			.spawn()
+			.map_err(|err| error!("Error opening trash: {err:#?}"))?
+			.wait()
+			.map_err(|err| error!("Error opening trash: {err:#?}"))?;
+
+		Ok(())
+	}
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[serde(tag = "type")]
+pub enum DragAndDropEvent {
+	Hovered { paths: Vec<String>, x: f64, y: f64 },
+	Dropped { paths: Vec<String>, x: f64, y: f64 },
+	Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepLinkEvent {
+	data: String,
+}
+
+#[tokio::main]
+async fn main() -> tauri::Result<()> {
+	#[cfg(target_os = "linux")]
+	sd_desktop_linux::normalize_environment();
+
+	let builder = Builder::new()
+		.commands(tauri_specta::collect_commands![
+			app_ready,
+			reset_spacedrive,
+			open_logs_dir,
+			refresh_menu_bar,
+			reload_webview,
+			set_menu_bar_item_state,
+			request_fda_macos,
+			open_trash_in_os_explorer,
+			drag::start_drag,
+			drag::stop_drag,
+			file::open_file_paths,
+			file::open_ephemeral_files,
+			file::get_file_path_open_with_apps,
+			file::get_ephemeral_files_open_with_apps,
+			file::open_file_path_with,
+			file::open_ephemeral_file_with,
+			file::reveal_items,
+			theme::lock_app_theme,
+			updater::check_for_update,
+			updater::install_update
+		])
+		.events(collect_events![DragAndDropEvent]);
+
+	#[cfg(debug_assertions)]
+	builder
+		.export(
+			Typescript::default()
+				.formatter(specta_typescript::formatter::prettier)
+				.header("/* eslint-disable */"),
+			"../src/commands.ts",
+		)
+		.expect("Failed to export typescript bindings");
+
+	tauri::Builder::default()
+		.invoke_handler(builder.invoke_handler())
+		.plugin(tauri_plugin_deep_link::init())
+		.plugin(tauri_plugin_cors_fetch::init())
+		.setup(move |app| {
+			// We need a the app handle to determine the data directory now.
+			// This means all the setup code has to be within `setup`, however it doesn't support async so we `block_on`.
+			let handle = app.handle().clone();
+			app.listen("deep-link://new-url", move |event| {
+				let deep_link_event = DeepLinkEvent {
+					data: event.payload().to_string(),
+				};
+				println!("Deep link event={:?}", deep_link_event);
+
+				handle.emit("deeplink", deep_link_event).unwrap();
+			});
+
+			block_in_place(|| {
+				block_on(async move {
+					builder.mount_events(app);
+
+					let data_dir = app
+						.path()
+						.data_dir()
+						.unwrap_or_else(|_| PathBuf::from("./"))
+						.join("spacedrive");
+
+					#[cfg(debug_assertions)]
+					let data_dir = data_dir.join("dev");
+
+					// The `_guard` must be assigned to variable for flushing remaining logs on main exit through Drop
+					let (_guard, result) = match Node::init_logger(&data_dir) {
+						Ok(guard) => (Some(guard), Node::new(data_dir).await),
+						Err(err) => (None, Err(NodeError::Logger(err))),
+					};
+
+					let handle = app.handle();
+					let (node, router) = match result {
+						Ok(r) => r,
+						Err(err) => {
+							error!("Error starting up the node: {err:#?}");
+							handle.plugin(sd_error_plugin(err))?;
+							return Ok(());
 						}
-					}
-				});
+					};
 
-				#[cfg(target_os = "windows")]
-				window.set_decorations(true).unwrap();
+					let should_clear_local_storage = node.libraries.get_all().await.is_empty();
+
+					handle.plugin(rspc::integrations::tauri::plugin(router, {
+						let node = node.clone();
+						move || node.clone()
+					}))?;
+					handle.plugin(sd_server_plugin(node.clone()).await.unwrap())?; // TODO: Handle `unwrap`
+					handle.manage(node.clone());
+
+					handle.windows().iter().for_each(|(_, window)| {
+						if should_clear_local_storage {
+							debug!("cleaning localStorage");
+							for webview in window.webviews() {
+								webview.eval("localStorage.clear();").ok();
+							}
+						}
+
+						tokio::spawn({
+							let window = window.clone();
+							async move {
+								sleep(Duration::from_secs(3)).await;
+								if !window.is_visible().unwrap_or(true) {
+									// This happens if the JS bundle crashes and hence doesn't send ready event.
+									println!(
+										"Window did not emit `app_ready` event fast enough. Showing window..."
+									);
+									window.show().expect("Main window should show");
+								}
+							}
+						});
+
+						#[cfg(target_os = "windows")]
+						window.set_decorations(false).unwrap();
+
+						#[cfg(target_os = "macos")]
+						{
+							unsafe {
+								sd_desktop_macos::set_titlebar_style(
+									&window.ns_window().expect("NSWindows must exist on macOS"),
+									false,
+								);
+								sd_desktop_macos::disable_app_nap(
+									&"File indexer needs to run unimpeded".into(),
+								);
+							};
+						}
+					});
+
+					Ok(())
+				})
+			})
+		})
+		.on_window_event(move |window, event| match event {
+			// macOS expected behavior is for the app to not exit when the main window is closed.
+			// Instead, the window is hidden and the dock icon remains so that on user click it should show the window again.
+			#[cfg(target_os = "macos")]
+			WindowEvent::CloseRequested { api, .. } => {
+				// TODO: make this multi-window compatible in the future
+				window
+					.app_handle()
+					.hide()
+					.expect("Window should hide on macOS");
+				api.prevent_close();
+			}
+			WindowEvent::Resized(_) => {
+				let (_state, command) =
+					if window.is_fullscreen().expect("Can't get fullscreen state") {
+						(true, "window_fullscreened")
+					} else {
+						(false, "window_not_fullscreened")
+					};
+
+				window
+					.emit("keybind", command)
+					.expect("Unable to emit window event");
 
 				#[cfg(target_os = "macos")]
 				{
-					use sd_desktop_macos::*;
-
-					let window = window.ns_window().unwrap();
-
-					unsafe { set_titlebar_style(&window, true, true) };
-					unsafe { blur_window_background(&window) };
+					let nswindow = window.ns_window().unwrap();
+					unsafe { sd_desktop_macos::set_titlebar_style(&nswindow, _state) };
 				}
-			});
-
-			// Configure IPC for custom protocol
-			app.ipc_scope().configure_remote_access(
-				RemoteDomainAccessScope::new("localhost")
-					.allow_on_scheme("spacedrive")
-					.add_window("main")
-					.enable_tauri_api(),
-			);
-
-			Ok(())
-		})
-		.on_menu_event(menu::handle_menu_event)
-		.menu(menu::get_menu())
-		.invoke_handler(tauri_handlers![
-			app_ready,
-			file::open_file_path,
-			file::get_file_path_open_with_apps,
-			file::open_file_path_with
-		])
-		.build(tauri::generate_context!())?;
-
-	app.run(move |app_handler, event| {
-		if let RunEvent::ExitRequested { .. } = event {
-			debug!("Closing all open windows...");
-			app_handler
-				.windows()
-				.iter()
-				.for_each(|(window_name, window)| {
-					debug!("closing window: {window_name}");
-					if let Err(e) = window.close() {
-						error!("failed to close window '{}': {:#?}", window_name, e);
-					}
-				});
-
-			if let Some(node) = &node {
-				block_in_place(|| block_on(node.shutdown()));
 			}
-
-			#[cfg(target_os = "linux")]
-			block_in_place(|| block_on(tx.send(()))).ok();
-
-			app_handler.exit(0);
-		}
-	});
+			_ => {}
+		})
+		.menu(menu::setup_menu)
+		.plugin(tauri_plugin_dialog::init())
+		.plugin(tauri_plugin_os::init())
+		.plugin(tauri_plugin_shell::init())
+		.plugin(tauri_plugin_http::init())
+		// TODO: Bring back Tauri Plugin Window State - it was buggy so we removed it.
+		.plugin(tauri_plugin_updater::Builder::new().build())
+		.plugin(updater::plugin())
+		.manage(updater::State::default())
+		.manage(drag::DragState::default())
+		.build(tauri::generate_context!())?
+		.run(|_, _| {});
 
 	Ok(())
 }

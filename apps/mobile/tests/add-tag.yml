@@ -2,11 +2,13 @@ appId: com.spacedrive.app
 ---
 - launchApp
 - tapOn:
-    id: 'drawer-toggle'
-- tapOn: 'Add Tag'
+    id: 'browse-tab'
+- waitForAnimationToEnd
 - tapOn:
-    id: 'create-tag-name'
+    id: 'create-tag-button'
 - inputText: 'MyTag'
-- tapOn: Create
-- assertVisible:
-    id: 'drawer-tag'
+- tapOn:
+    text: 'Create'
+- tapOn:
+    id: 'show-all-tags-button'
+- assertVisible: 'MyTag'

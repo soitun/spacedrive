@@ -1,96 +1,76 @@
-use std::{collections::BTreeMap, fmt::Debug};
+use crate::{DevicePubId, ModelId};
+
+use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
-use specta::Type;
 use uhlc::NTP64;
-use uuid::Uuid;
 
-#[derive(Serialize, Deserialize, Clone, Debug, Type)]
-pub enum RelationOperationData {
+pub enum OperationKind<'a> {
 	Create,
-	Update { field: String, value: Value },
+	Update(Vec<&'a str>),
 	Delete,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Type)]
-pub struct RelationOperation {
-	pub relation_item: Uuid,
-	pub relation_group: Uuid,
-	pub relation: String,
-	pub data: RelationOperationData,
+impl fmt::Display for OperationKind<'_> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			OperationKind::Create => write!(f, "c"),
+			OperationKind::Update(fields) => write!(f, "u:{}:", fields.join(":")),
+			OperationKind::Delete => write!(f, "d"),
+		}
+	}
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Type)]
-pub enum SharedOperationCreateData {
+#[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
+pub enum CRDTOperationData {
+	#[serde(rename = "c")]
+	Create(BTreeMap<String, rmpv::Value>),
 	#[serde(rename = "u")]
-	Unique(Map<String, Value>),
-	#[serde(rename = "a")]
-	Atomic,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Type)]
-#[serde(untagged)]
-pub enum SharedOperationData {
-	Create(SharedOperationCreateData),
-	Update { field: String, value: Value },
+	Update(BTreeMap<String, rmpv::Value>),
+	#[serde(rename = "d")]
 	Delete,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Type)]
-pub struct SharedOperation {
-	pub record_id: Value,
-	pub model: String,
-	pub data: SharedOperationData,
+impl CRDTOperationData {
+	#[must_use]
+	pub fn create() -> Self {
+		Self::Create(BTreeMap::default())
+	}
+
+	#[must_use]
+	pub fn as_kind(&self) -> OperationKind<'_> {
+		match self {
+			Self::Create(_) => OperationKind::Create,
+			Self::Update(fields_and_values) => {
+				OperationKind::Update(fields_and_values.keys().map(String::as_str).collect())
+			}
+			Self::Delete => OperationKind::Delete,
+		}
+	}
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Type)]
-pub enum OwnedOperationData {
-	Create(BTreeMap<String, Value>),
-	CreateMany {
-		values: Vec<(Value, BTreeMap<String, Value>)>,
-		skip_duplicates: bool,
-	},
-	Update(BTreeMap<String, Value>),
-	Delete,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Type)]
-pub struct OwnedOperationItem {
-	pub id: Value,
-	pub data: OwnedOperationData,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Type)]
-pub struct OwnedOperation {
-	pub model: String,
-	pub items: Vec<OwnedOperationItem>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Type)]
-#[serde(untagged)]
-pub enum CRDTOperationType {
-	Shared(SharedOperation),
-	Relation(RelationOperation),
-	Owned(OwnedOperation),
-}
-
-#[derive(Serialize, Deserialize, Clone, Type)]
+#[derive(PartialEq, Serialize, Deserialize, Clone)]
 pub struct CRDTOperation {
-	pub node: Uuid,
-	#[specta(type = u32)]
+	pub device_pub_id: DevicePubId,
 	pub timestamp: NTP64,
-	pub id: Uuid,
-	// #[serde(flatten)]
-	pub typ: CRDTOperationType,
+	pub model_id: ModelId,
+	pub record_id: rmpv::Value,
+	pub data: CRDTOperationData,
 }
 
-impl Debug for CRDTOperation {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl CRDTOperation {
+	#[must_use]
+	pub fn kind(&self) -> OperationKind<'_> {
+		self.data.as_kind()
+	}
+}
+
+impl fmt::Debug for CRDTOperation {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("CRDTOperation")
-			.field("node", &self.node.to_string())
-			.field("timestamp", &self.timestamp.to_string())
-			.field("typ", &self.typ)
-			.finish()
+			.field("data", &self.data)
+			.field("model", &self.model_id)
+			.field("record_id", &self.record_id.to_string())
+			.finish_non_exhaustive()
 	}
 }

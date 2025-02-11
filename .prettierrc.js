@@ -1,3 +1,5 @@
+const path = require('node:path');
+
 /**
  * {@type require('prettier').Config}
  */
@@ -11,17 +13,19 @@ module.exports = {
 	quoteProps: 'consistent',
 	importOrder: [
 		// external packages
-		'^([A-Za-z]|@[^s/])',
+		'<THIRD_PARTY_MODULES>',
 		// spacedrive packages
 		'^@sd/(interface|client|ui)(/.*)?$',
-		// this package
+		// internal packages
+		'^@/',
 		'^~/',
+		'',
 		// relative
-		'^\\.'
+		'^[../]',
+		'^[./]'
 	],
-	importOrderSortSpecifiers: true,
-	importOrderParserPlugins: ['importAssertions', 'typescript', 'jsx'],
-	pluginSearchDirs: false,
-	plugins: ['@trivago/prettier-plugin-sort-imports', 'prettier-plugin-tailwindcss'],
-	tailwindConfig: './packages/ui/tailwind.config.js'
+	importOrderParserPlugins: ['typescript', 'jsx', 'decorators'],
+	importOrderTypeScriptVersion: '5.0.0',
+	tailwindConfig: path.resolve(path.join(__dirname, 'packages/ui/tailwind.config.js')),
+	plugins: ['@ianvs/prettier-plugin-sort-imports', 'prettier-plugin-tailwindcss']
 };

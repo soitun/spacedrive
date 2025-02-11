@@ -1,36 +1,47 @@
 import { CompositeScreenProps } from '@react-navigation/native';
-import { StackScreenProps, createStackNavigator } from '@react-navigation/stack';
+import { createNativeStackNavigator, NativeStackScreenProps } from '@react-navigation/native-stack';
 import Header from '~/components/header/Header';
-import { tw } from '~/lib/tailwind';
-import OverviewScreen from '../../screens/Overview';
-import { SharedScreens, SharedScreensParamList } from '../SharedScreens';
+import SearchHeader from '~/components/header/SearchHeader';
+import CategoriesScreen from '~/screens/overview/Categories';
+import OverviewScreen from '~/screens/overview/Overview';
+
 import { TabScreenProps } from '../TabNavigator';
 
-const Stack = createStackNavigator<OverviewStackParamList>();
+const Stack = createNativeStackNavigator<OverviewStackParamList>();
 
 export default function OverviewStack() {
 	return (
 		<Stack.Navigator
-			initialRouteName="Overview"
 			screenOptions={{
-				headerStyle: { backgroundColor: tw.color('app-box') },
-				headerTintColor: tw.color('ink'),
-				headerTitleStyle: tw`text-base`,
-				headerBackTitleStyle: tw`text-base`
+				fullScreenGestureEnabled: true
 			}}
+			initialRouteName="Overview"
 		>
-			<Stack.Screen name="Overview" component={OverviewScreen} options={{ header: Header }} />
-			{SharedScreens(Stack as any)}
+			<Stack.Screen
+				name="Overview"
+				component={OverviewScreen}
+				options={({ route }) => ({
+					header: () => <Header search route={route} />
+				})}
+			/>
+			<Stack.Screen
+				name="Categories"
+				component={CategoriesScreen}
+				options={({ route }) => ({
+					header: () => <SearchHeader kind="categories" route={route} />
+				})}
+			/>
 		</Stack.Navigator>
 	);
 }
 
 export type OverviewStackParamList = {
 	Overview: undefined;
-} & SharedScreensParamList;
+	Categories: undefined;
+};
 
 export type OverviewStackScreenProps<Screen extends keyof OverviewStackParamList> =
 	CompositeScreenProps<
-		StackScreenProps<OverviewStackParamList, Screen>,
+		NativeStackScreenProps<OverviewStackParamList, Screen>,
 		TabScreenProps<'OverviewStack'>
 	>;
